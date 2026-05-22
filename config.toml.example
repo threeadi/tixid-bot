@@ -1,0 +1,60 @@
+[auth]
+# Nomor HP (dengan kode negara)
+msisdn = "+6289xxxx"
+# Password TERENKRIPSI (RSA) — salin dari browser DevTools > Network > login request > payload "password"
+password = "HE4n7ViZkM9iNn/dQnvgaaLvSeg2pH81V5L1p/eBzYnvOl4TQ=="
+
+[target]
+# ID movie dari URL tix.id (GET /v1/movies/{movie_id})
+movie_id = "2039608798242488320"
+# Kota Malang
+city_id = "973818515335155712"
+# Tanggal nonton (format YYYY-MM-DD). Kosongkan ("") untuk otomatis pakai tanggal pertama tersedia.
+date = ""
+
+[theater]
+# Urutan prioritas bioskop (dicoba dari atas ke bawah, substring case-insensitive)
+# Kosongkan [] untuk tidak ada preferensi
+theater_priority = [
+    "TRANSMART MX MALL XXI",
+    "MALANG TOWN SQUARE CINEPOLIS",
+    "ARAYA XXI",
+    "MALANG CITY POINT CGV",
+]
+
+[showtime]
+# Rentang jam yang diinginkan (format HH:MM, 24 jam). Kosongkan ("") untuk semua jam.
+preferred_time_start = "12:00"
+preferred_time_end = "22:00"
+
+[seat]
+# Jumlah tiket
+quantity = 2
+# Kursi manual (dicoba duluan jika tersedia). Kosongkan [] untuk auto-select.
+manual_seats = []
+# Lewati N baris pertama (A=0, B=1, C=2 → avoid_first_rows=3 = skip A,B,C)
+avoid_first_rows = 3
+# Range baris yang disukai [baris_awal, baris_akhir] inklusif. [] = semua baris tersedia.
+preferred_rows = ["D", "H"]
+
+[device]
+# Device ID (bisa salin dari browser DevTools, atau biarkan default)
+device_id = "019e4e4e-f638-7fca-b747-69e48a9eef32"
+
+[payment]
+# Metode pembayaran default. Opsi tersedia: lihat GET /v1/orders/{id}/payment
+# payment_method: "NETWORK_PAY" untuk semua e-wallet & QRIS
+# payment_option: "NETWORK_PAY_PG_QRIS" | "NETWORK_PAY_PG_DANA" | "NETWORK_PAY_PG_OVO"
+payment_method = "NETWORK_PAY"
+payment_option = "NETWORK_PAY_PG_QRIS"
+
+[polling]
+# Mode standby untuk rebutan tiket: bot akan terus cek sampai jadwal/showtime yang cocok muncul.
+enabled = true
+# Jeda antar retry saat film masih UPCOMING / schedule belum ada / showtime belum cocok.
+interval_secs = 2
+# Login ulang sebelum token terlalu lama dipakai saat standby.
+refresh_token_before_secs = 1500
+# WIB, format: "YYYY-MM-DD HH:MM:SS". Kosongkan "" untuk mulai sekarang.
+start_at = ""
+
