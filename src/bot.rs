@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use chrono::{FixedOffset, NaiveDateTime, TimeZone, Utc};
 use qrcode::{QrCode, render::unicode};
 use reqwest::Client;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use crate::{api, client, config, seat_selector, theater_selector};
@@ -30,33 +32,11 @@ pub async fn run() -> Result<()> {
     let mut auth = authenticate(&cfg).await?;
 
     // ── 3. Poll until movie schedule/showtime is ready ──────────────────────
-    let (movie, target_date, selected) = wait_for_target_showtime(&cfg, &mut auth).await?;
+    let (movie, target_date, ranked) = wait_for_target_showtime(&cfg, &mut auth).await?;
 
-    println!();
-    println!("🎬 Selected showtime:");
-    println!("   Movie:     {}", movie.name);
-    println!("   Theater:  {}", selected.theater.name);
-    println!("   Time:     {}", selected.showtime.display_time);
-    println!("   Studio:   {}", selected.showtime.studio);
-    println!("   Date:     {}", target_date);
-    println!("   Category: {}", selected.category);
-    println!("   Price:    Rp{}", fmt_rupiah(selected.showtime.price));
-    tracing::info!(
-        movie = %movie.name,
-        theater = %selected.theater.name,
-        time = %selected.showtime.display_time,
-        studio = %selected.showtime.studio,
-        date = %target_date,
-        category = %selected.category,
-        price = selected.showtime.price,
-        showtime_id = %selected.showtime.id,
-        "showtime selected"
-    );
-
-    // ── 4. Get seat layout ────────────────────────────────────────────────────
-    print!("\n💺 Fetching seat layout...");
-    let layout =
-        api::get_seat_layout(&auth.http, &selected.merchant_slug, &selected.showtime.id).await?;
+    // ── 4 & 5. Find theater with N consecutive seats (try in priority order) ─
+    let (selected, layout, seats) =
+        try_theaters_for_seats(&auth.http, &cfg, &ranked).await?;
 
     let available_count: usize = layout
         .seat_map
@@ -69,20 +49,34 @@ pub async fn run() -> Result<()> {
         .iter()
         .flat_map(|sm| sm.seat_rows.iter())
         .count();
+
+    println!();
+    println!("🎬 Selected showtime:");
+    println!("   Movie:     {}", movie.name);
+    println!("   Theater:  {}", selected.theater.name);
+    println!("   Time:     {}", selected.showtime.display_time);
+    println!("   Studio:   {}", selected.showtime.studio);
+    println!("   Date:     {}", target_date);
+    println!("   Category: {}", selected.category);
+    println!("   Price:    Rp{}", fmt_rupiah(selected.showtime.price));
     println!(
-        "\r✅ Available: {}/{} seats (tx limit: {})          ",
+        "✅ Available: {}/{} seats (tx limit: {})          ",
         available_count, total_count, layout.user_seat_transaction_limit
     );
+    tracing::info!(
+        movie = %movie.name,
+        theater = %selected.theater.name,
+        time = %selected.showtime.display_time,
+        studio = %selected.showtime.studio,
+        date = %target_date,
+        category = %selected.category,
+        price = selected.showtime.price,
+        showtime_id = %selected.showtime.id,
+        "showtime selected"
+    );
 
-    // ── 5. Select seats ───────────────────────────────────────────────────────
-    let seats = seat_selector::select(&layout.seat_map, &cfg.seat).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Could not find {} suitable consecutive seats. Try reducing quantity or adjusting preferred_rows.",
-            cfg.seat.quantity
-        )
-    })?;
-    println!("💺 Selected seats: {}", seats.join(", "));
-    tracing::info!(seats = %seats.join(", "), "seats selected");
+    println!("💺 Selected seats: {}", seats.iter().map(|s| s.display.as_str()).collect::<Vec<_>>().join(", "));
+    tracing::info!(seats = %seats.iter().map(|s| s.display.as_str()).collect::<Vec<_>>().join(", "), theater = %selected.theater.name, "seats selected");
 
     // ── 6. Create order ───────────────────────────────────────────────────────
     println!("\n🛒 Placing order...");
@@ -277,10 +271,129 @@ async fn wait_until_start(start_at: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fire ALL seat layout requests in parallel, then resolve to the highest-ranked
+/// theater that has N consecutive seats.
+///
+/// Signaling logic:
+///   - Each spawned task sends `(rank, Option<(layout, seats)>)` on a channel.
+///   - As results arrive, we check: "do we have seats at rank R, AND have ALL ranks
+///     0..R already responded (without seats)?" → that's the confirmed winner.
+///   - The moment a winner is confirmed, all remaining in-flight JoinHandles are
+///     aborted — cancelling their HTTP requests immediately.
+async fn try_theaters_for_seats(
+    http: &Client,
+    cfg: &config::Config,
+    ranked: &[theater_selector::SelectedShowtime],
+) -> Result<(theater_selector::SelectedShowtime, crate::models::SeatLayoutData, Vec<crate::models::SelectedSeat>)> {
+    if ranked.is_empty() {
+        return Err(anyhow::anyhow!("No theaters available"));
+    }
+
+    let n = ranked.len();
+
+    println!("\n💺 Checking {} theater(s) for {} consecutive seats (parallel)...", n, cfg.seat.quantity);
+
+    // Channel: (rank, payload) — payload is None when no seats or error
+    let (tx, mut rx) = mpsc::unbounded_channel::<(usize, Option<(crate::models::SeatLayoutData, Vec<crate::models::SelectedSeat>)>)>();
+
+    // Spawn all seat layout requests simultaneously
+    let handles: Vec<JoinHandle<()>> = ranked
+        .iter()
+        .enumerate()
+        .map(|(rank, candidate)| {
+            let tx = tx.clone();
+            let http = http.clone();
+            let merchant_slug = candidate.merchant_slug.clone();
+            let showtime_id = candidate.showtime.id.clone();
+            let theater_name = candidate.theater.name.clone();
+            let seat_config = cfg.seat.clone();
+            tokio::spawn(async move {
+                tracing::debug!(rank, theater = %theater_name, "fetching seat layout (parallel)");
+                let payload = match api::get_seat_layout(&http, &merchant_slug, &showtime_id).await {
+                    Ok(layout) => {
+                        let seats = seat_selector::select(&layout.seat_map, &seat_config);
+                        seats.map(|s| (layout, s))
+                    }
+                    Err(e) => {
+                        tracing::warn!(rank, theater = %theater_name, error = %e, "seat layout fetch failed");
+                        None
+                    }
+                };
+                let _ = tx.send((rank, payload));
+            })
+        })
+        .collect();
+    drop(tx); // drop original; channel closes when all tasks finish
+
+    // Indexed by rank: None = not yet responded, Some(None) = responded, no seats,
+    // Some(Some(_)) = responded with seats
+    let mut received: Vec<Option<Option<(crate::models::SeatLayoutData, Vec<crate::models::SelectedSeat>)>>> =
+        (0..n).map(|_| None).collect();
+    let mut responded_count = 0;
+
+    while let Some((rank, payload)) = rx.recv().await {
+        let theater_name = &ranked[rank].theater.name;
+        let display_time = &ranked[rank].showtime.display_time;
+
+        if payload.is_some() {
+            println!(
+                "  ✅ Rank#{} {} ({}) — {} consecutive seats available",
+                rank + 1, theater_name, display_time, cfg.seat.quantity
+            );
+            tracing::info!(rank, theater = %theater_name, "consecutive seats found");
+        } else {
+            println!(
+                "  ⏭️  Rank#{} {} ({}) — no {} consecutive seats",
+                rank + 1, theater_name, display_time, cfg.seat.quantity
+            );
+            tracing::warn!(rank, theater = %theater_name, "no consecutive seats");
+        }
+
+        received[rank] = Some(payload);
+        responded_count += 1;
+
+        // Find the best (lowest rank = highest priority) that has seats
+        if let Some(best_rank) = (0..n).find(|&r| {
+            received[r].as_ref().is_some_and(|p| p.is_some())
+        }) {
+            // Confirm: all ranks with higher priority (lower index) have responded without seats
+            if (0..best_rank).all(|r| received[r].is_some()) {
+                // Abort any still-running lower-priority requests
+                let aborted: usize = handles
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| received[*i].is_none())
+                    .map(|(_, h)| { h.abort(); 1 })
+                    .sum();
+                if aborted > 0 {
+                    tracing::info!(aborted, best_rank, "aborted lower-priority seat layout requests");
+                }
+
+                let (layout, seats) = received[best_rank].take().unwrap().unwrap();
+                println!(
+                    "🏆 Winner: Rank#{} {} — seats: {}",
+                    best_rank + 1, ranked[best_rank].theater.name,
+                    seats.iter().map(|s| s.display.as_str()).collect::<Vec<_>>().join(", ")
+                );
+                return Ok((ranked[best_rank].clone(), layout, seats));
+            }
+        }
+
+        if responded_count == n {
+            break;
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "No theater has {} consecutive available seats. Try reducing quantity or adjusting preferred_rows.",
+        cfg.seat.quantity
+    ))
+}
+
 async fn wait_for_target_showtime(
     cfg: &config::Config,
     auth: &mut AuthSession,
-) -> Result<(crate::models::MovieData, String, theater_selector::SelectedShowtime)> {
+) -> Result<(crate::models::MovieData, String, Vec<theater_selector::SelectedShowtime>)> {
     loop {
         refresh_auth_if_needed(cfg, auth).await?;
 
@@ -337,10 +450,9 @@ async fn wait_for_target_showtime(
             schedules.theaters.len()
         );
 
-        if let Some(selected) =
-            theater_selector::select(&schedules.theaters, &cfg.theater, &cfg.showtime)
-        {
-            return Ok((movie, target_date, selected));
+        let ranked = theater_selector::rank(&schedules.theaters, &cfg.theater, &cfg.showtime, &target_date, &cfg.target.blocked_datetime_ranges);
+        if !ranked.is_empty() {
+            return Ok((movie, target_date, ranked));
         }
 
         wait_or_fail(
@@ -351,16 +463,38 @@ async fn wait_for_target_showtime(
     }
 }
 
+fn normalize_dt_start(s: &str) -> String {
+    if s.len() == 10 { format!("{} 00:00", s) } else { s.to_string() }
+}
+
+fn normalize_dt_end(s: &str) -> String {
+    if s.len() == 10 { format!("{} 23:59", s) } else { s.to_string() }
+}
+
 fn pick_target_date(cfg: &config::Config, dates: &[crate::models::ScheduleDate]) -> Option<String> {
+    let is_blocked = |date: &str| -> bool {
+        let day_start = format!("{} 00:00", date);
+        let day_end   = format!("{} 23:59", date);
+        cfg.target.blocked_datetime_ranges.iter().any(|range| {
+            if range.len() == 2 {
+                let start = normalize_dt_start(&range[0]);
+                let end   = normalize_dt_end(&range[1]);
+                start <= day_start && end >= day_end
+            } else {
+                false
+            }
+        })
+    };
+
     if cfg.target.date.is_empty() {
         dates
             .iter()
-            .find(|d| d.is_any_schedule)
+            .find(|d| d.is_any_schedule && !is_blocked(&d.date))
             .map(|d| d.date.clone())
     } else {
         dates
             .iter()
-            .find(|d| d.date == cfg.target.date && d.is_any_schedule)
+            .find(|d| d.date == cfg.target.date && d.is_any_schedule && !is_blocked(&d.date))
             .map(|d| d.date.clone())
     }
 }
@@ -417,5 +551,243 @@ fn render_qr_terminal(payload: &str) {
         }
     } else {
         println!("   ⚠️  Failed to render QR code.");
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        AuthConfig, Config, DeviceConfig, PaymentConfig, PollingConfig,
+        SeatConfig, ShowtimeConfig, TargetConfig, TheaterConfig,
+    };
+    use crate::models::ScheduleDate;
+
+    fn make_config(date: &str, blocked: Vec<Vec<String>>) -> Config {
+        Config {
+            auth: AuthConfig { msisdn: "08123".into(), password: "pw".into() },
+            target: TargetConfig {
+                movie_id: "m1".into(),
+                city_id: "c1".into(),
+                date: date.into(),
+                blocked_datetime_ranges: blocked,
+            },
+            theater: TheaterConfig { theater_priority: vec![], blocked_theaters: vec![] },
+            showtime: ShowtimeConfig { preferred_time_start: "".into(), preferred_time_end: "".into() },
+            seat: SeatConfig { quantity: 2, manual_seats: vec![], avoid_first_rows: 0, preferred_rows: vec![] },
+            device: DeviceConfig { device_id: "dev".into(), longitude: "0".into(), latitude: "0".into() },
+            payment: PaymentConfig { payment_method: "M".into(), payment_option: "O".into() },
+            polling: PollingConfig { enabled: false, interval_secs: 5, refresh_token_before_secs: 300, start_at: "".into() },
+        }
+    }
+
+    // ── fmt_rupiah ────────────────────────────────────────────────────────
+
+    #[test] fn fmt_rupiah_zero() { assert_eq!(fmt_rupiah(0), "0"); }
+    #[test] fn fmt_rupiah_under_thousand() { assert_eq!(fmt_rupiah(999), "999"); }
+    #[test] fn fmt_rupiah_exact_thousand() { assert_eq!(fmt_rupiah(1_000), "1.000"); }
+    #[test] fn fmt_rupiah_tens_of_thousands() { assert_eq!(fmt_rupiah(88_000), "88.000"); }
+    #[test] fn fmt_rupiah_hundreds_of_thousands() { assert_eq!(fmt_rupiah(150_000), "150.000"); }
+    #[test] fn fmt_rupiah_millions() { assert_eq!(fmt_rupiah(1_500_000), "1.500.000"); }
+    #[test] fn fmt_rupiah_large_number() { assert_eq!(fmt_rupiah(10_000_000), "10.000.000"); }
+
+    // ── wib ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wib_is_utc_plus_7_hours() {
+        assert_eq!(wib().local_minus_utc(), 7 * 3600);
+    }
+
+    // ── format_unix_wib ───────────────────────────────────────────────────
+
+    #[test]
+    fn format_unix_wib_has_wib_suffix() {
+        let s = format_unix_wib(1_748_736_000);
+        assert!(s.ends_with("WIB"), "got: {s}");
+    }
+
+    #[test]
+    fn format_unix_wib_correct_hour_for_midnight_utc() {
+        // 1748736000 = 2025-06-01 00:00:00 UTC → 2025-06-01 07:00:00 WIB
+        let s = format_unix_wib(1_748_736_000);
+        assert!(s.contains("07:00:00"), "got: {s}");
+    }
+
+    #[test]
+    fn format_unix_wib_correct_date() {
+        let s = format_unix_wib(1_748_736_000);
+        assert!(s.contains("2025-06-01"), "got: {s}");
+    }
+
+    // ── normalize_dt_start / normalize_dt_end ─────────────────────────────
+
+    #[test]
+    fn normalize_dt_start_date_only_appends_midnight() {
+        assert_eq!(normalize_dt_start("2025-06-01"), "2025-06-01 00:00");
+    }
+
+    #[test]
+    fn normalize_dt_start_datetime_unchanged() {
+        assert_eq!(normalize_dt_start("2025-06-01 12:30"), "2025-06-01 12:30");
+    }
+
+    #[test]
+    fn normalize_dt_end_date_only_appends_end_of_day() {
+        assert_eq!(normalize_dt_end("2025-06-01"), "2025-06-01 23:59");
+    }
+
+    #[test]
+    fn normalize_dt_end_datetime_unchanged() {
+        assert_eq!(normalize_dt_end("2025-06-01 18:00"), "2025-06-01 18:00");
+    }
+
+    // ── pick_target_date ──────────────────────────────────────────────────
+
+    #[test]
+    fn pick_target_date_specific_match_found() {
+        let cfg = make_config("2025-06-01", vec![]);
+        let dates = vec![
+            ScheduleDate { date: "2025-05-31".into(), is_any_schedule: true },
+            ScheduleDate { date: "2025-06-01".into(), is_any_schedule: true },
+        ];
+        assert_eq!(pick_target_date(&cfg, &dates), Some("2025-06-01".into()));
+    }
+
+    #[test]
+    fn pick_target_date_specific_not_in_list_returns_none() {
+        let cfg = make_config("2025-06-05", vec![]);
+        let dates = vec![ScheduleDate { date: "2025-06-01".into(), is_any_schedule: true }];
+        assert_eq!(pick_target_date(&cfg, &dates), None);
+    }
+
+    #[test]
+    fn pick_target_date_specific_exists_but_not_active_returns_none() {
+        let cfg = make_config("2025-06-01", vec![]);
+        let dates = vec![ScheduleDate { date: "2025-06-01".into(), is_any_schedule: false }];
+        assert_eq!(pick_target_date(&cfg, &dates), None);
+    }
+
+    #[test]
+    fn pick_target_date_empty_date_picks_first_active() {
+        let cfg = make_config("", vec![]);
+        let dates = vec![
+            ScheduleDate { date: "2025-06-01".into(), is_any_schedule: false },
+            ScheduleDate { date: "2025-06-02".into(), is_any_schedule: true },
+        ];
+        assert_eq!(pick_target_date(&cfg, &dates), Some("2025-06-02".into()));
+    }
+
+    #[test]
+    fn pick_target_date_blocked_date_skipped_picks_next() {
+        let blocked = vec![vec!["2025-06-01".into(), "2025-06-01".into()]];
+        let cfg = make_config("", blocked);
+        let dates = vec![
+            ScheduleDate { date: "2025-06-01".into(), is_any_schedule: true },
+            ScheduleDate { date: "2025-06-02".into(), is_any_schedule: true },
+        ];
+        assert_eq!(pick_target_date(&cfg, &dates), Some("2025-06-02".into()));
+    }
+
+    #[test]
+    fn pick_target_date_specific_blocked_returns_none() {
+        let blocked = vec![vec!["2025-06-01".into(), "2025-06-01".into()]];
+        let cfg = make_config("2025-06-01", blocked);
+        let dates = vec![ScheduleDate { date: "2025-06-01".into(), is_any_schedule: true }];
+        assert_eq!(pick_target_date(&cfg, &dates), None);
+    }
+
+    #[test]
+    fn pick_target_date_empty_schedule_list_returns_none() {
+        let cfg = make_config("", vec![]);
+        assert_eq!(pick_target_date(&cfg, &[]), None);
+    }
+
+    #[test]
+    fn pick_target_date_partial_day_block_does_not_block_whole_day() {
+        // Partial-day range covers only noon—14:00, should not block the whole date
+        let blocked = vec![vec!["2025-06-01 12:00".into(), "2025-06-01 14:00".into()]];
+        let cfg = make_config("2025-06-01", blocked);
+        let dates = vec![ScheduleDate { date: "2025-06-01".into(), is_any_schedule: true }];
+        // day_start="2025-06-01 00:00" < block_start="2025-06-01 12:00" → not fully covered
+        assert_eq!(pick_target_date(&cfg, &dates), Some("2025-06-01".into()));
+    }
+
+    // ── wait_until_start ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn wait_until_start_empty_string_returns_ok() {
+        assert!(wait_until_start("").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn wait_until_start_whitespace_returns_ok() {
+        assert!(wait_until_start("   ").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn wait_until_start_invalid_format_returns_err() {
+        assert!(wait_until_start("not-a-valid-datetime").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_until_start_past_datetime_returns_ok_immediately() {
+        // 2020-01-01 is well in the past → sleep(0s) → instant return
+        assert!(wait_until_start("2020-01-01 00:00:00").await.is_ok());
+    }
+
+    // ── wait_or_fail ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn wait_or_fail_disabled_returns_err_with_reason() {
+        // make_config sets polling.enabled = false
+        let cfg = make_config("", vec![]);
+        let result = wait_or_fail(&cfg, "no showtimes found").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no showtimes found"));
+    }
+
+    #[tokio::test]
+    async fn wait_or_fail_enabled_zero_interval_returns_ok() {
+        let mut cfg = make_config("", vec![]);
+        cfg.polling.enabled = true;
+        cfg.polling.interval_secs = 0; // zero sleep → returns instantly
+        let result = wait_or_fail(&cfg, "retrying").await;
+        assert!(result.is_ok());
+    }
+
+    // ── render_qr_terminal ────────────────────────────────────────────────
+
+    #[test]
+    fn render_qr_terminal_short_payload_does_not_panic() {
+        render_qr_terminal("HELLO_WORLD");
+    }
+
+    #[test]
+    fn render_qr_terminal_empty_payload_does_not_panic() {
+        // empty → QrCode::new succeeds with empty content
+        render_qr_terminal("");
+    }
+
+    #[test]
+    fn render_qr_terminal_realistic_qris_does_not_panic() {
+        render_qr_terminal("00020101021226580013ID.CO.BNI.WWW01189360050400015743700203BNI51440014ID.CO.QRIS.WWW0215ID20230705183270303UMI5204599953033605802ID5911Test Store6013Jakarta Pusat63043E2A");
+    }
+
+    // ── refresh_auth_if_needed (early return path) ────────────────────────
+
+    #[tokio::test]
+    async fn refresh_auth_if_needed_returns_ok_immediately_when_recently_authed() {
+        // authenticated_at = Instant::now() → elapsed ≈ 0 < refresh_token_before_secs (300)
+        // → function returns Ok(()) without any network call
+        let cfg = make_config("", vec![]);
+        let mut auth = AuthSession {
+            http: crate::client::build(None, "test-device").unwrap(),
+            user_name: "tester".into(),
+            refresh_token: "".into(),
+            authenticated_at: std::time::Instant::now(),
+        };
+        assert!(refresh_auth_if_needed(&cfg, &mut auth).await.is_ok());
     }
 }

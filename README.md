@@ -49,14 +49,21 @@ Target: secepat mungkin dari start → seat hold → QRIS payment.
 - [x] Audit events: login, showtime selected, seats selected, order created, checkout completed
 - [x] Error API (response `success: false`) di-handle dengan pesan yang jelas
 
-### v1.4 — Multi-account 📋 Planned
+### v1.4 — Smart Seating ✅ DONE
 
-- [ ] Support array akun di `config.toml`
-- [ ] Beli tiket dari beberapa akun sekaligus (concurrently)
+- [x] Ranking semua bioskop sesuai `theater_priority`
+- [x] Parallel seat layout fetch — semua request dikirim serentak
+- [x] Signaling: pemenang dikonfirmasi sesuai ranking, bukan siapa yang reply duluan
+- [x] Abort otomatis semua in-flight request begitu pemenang dikonfirmasi
+- [x] Fallback ke bioskop berikutnya jika tidak ada N kursi berurutan
 
----
+### v1.5 — Multi-format Seat Layout ✅ DONE
 
-## ⚙️ Setup
+- [x] Auto-deteksi format seat layout: XXI (nested `seat_map`) vs Cinepolis/CGV (flat list)
+- [x] `SelectedSeat` struct membawa `seat_id` (booking ID), `display` (label), `grd_cd` (price tier)
+- [x] Kirim `seat_grd_cd` yang benar ke `create_order` (kode tier harga, bukan seat_id)
+- [x] Grid/aisle awareness: kursi di sisi kanan/kiri lorong tengah Cinepolis tidak dianggap berurutan
+- [x] Spacer/aisle marker (`seat_yn: "0"`) difilter otomatis dari Cinepolis/CGV layout
 
 ### Prerequisites
 
@@ -70,7 +77,7 @@ Target: secepat mungkin dari start → seat hold → QRIS payment.
 cd tixid-bot
 
 # Edit konfigurasi
-cp config.example.toml config.toml
+cp config.toml.example config.toml
 # isi msisdn, password (RSA-encrypted dari browser), movie_id, dll
 
 # Build release (optimized)
@@ -110,7 +117,7 @@ preferred_time_end   = "22:00"
 [seat]
 quantity           = 2
 manual_seats       = []                 # contoh: ["D6","D7"] — dicoba duluan
-avoid_first_rows   = 3                  # skip N baris depan (A,B,C = 3)
+avoid_first_rows   = 3                  # skip N baris paling depan/dekat layar (A=belakang, huruf besar=dekat layar)
 preferred_rows     = ["D", "H"]         # range baris disukai (inklusif, boleh terbalik)
 
 [device]
@@ -193,6 +200,7 @@ https://app.tix.id/movie/detail/2039608798242488320
 ========================================
    Method:    NETWORK_PAY_PG_QRIS
    Amount:    Rp88.000
+   Total time: 1.851s
 
    QRIS Code:
    00020101021226570011ID.DANA...
@@ -212,27 +220,69 @@ https://app.tix.id/movie/detail/2039608798242488320
 
 ## 🧠 Algoritma Pilih Bioskop & Kursi
 
-### Pilih Bioskop (Theater Priority)
+### Ranking Bioskop + Cek Kursi (Parallel Race + Early Abort)
+
+Bot **meranking semua bioskop** lalu mengirim **semua seat layout request secara SERENTAK** (parallel). Hasil diproses sesuai urutan prioritas — begitu pemenang tertinggi dikonfirmasi, semua request lain langsung **dibatalkan (abort)**.
 
 ```
-1. Iterasi theater_priority dari atas ke bawah (substring match, case-insensitive)
-2. Untuk setiap bioskop prioritas:
-   a. Cek apakah ada showtime (status=1) dalam rentang jam config
-   b. Jika ya → pilih bioskop ini
-3. Fallback ke bioskop pertama yang punya showtime valid dalam rentang jam
-4. theater_priority = [] → ambil bioskop pertama tersedia
+1. Rank semua bioskop berdasarkan theater_priority (substring match, case-insensitive):
+   a. Bioskop yang cocok priority[0] → rank 1 (tertinggi)
+   b. Bioskop yang cocok priority[1] → rank 2
+   c. dst...
+   d. Bioskop yang tidak masuk priority → rank terakhir (fallback)
+
+2. Kirim SEMUA seat layout request serentak (tokio parallel tasks)
+
+3. Setiap task mengirim sinyal saat selesai: (rank, hasil)
+   → Hasil: Some(layout+seats) jika ada N kursi berurutan, None jika tidak
+
+4. Konfirmasi pemenang:
+   - Saat rank R punya kursi DAN semua rank < R sudah menjawab tanpa kursi → rank R menang
+   - Abort semua task yang masih berjalan (rank > R)
+   - Langsung checkout dengan rank R
+
+5. Jika semua bioskop tidak ada yang punya N kursi berurutan → error
 ```
 
-### Pilih Kursi
+**Mengapa lebih cepat:**
+
+```
+Worst-case sequential (lama): latency × N = 150ms × 4 = 600ms
+Parallel race (baru):         max(latency)  = 150ms       ✅ 4x lebih cepat
+Happy path (rank#1 punya kursi): sama saja — ~150ms, tapi request lain sudah dibatalkan
+```
+
+**Contoh (quantity=2, 4 bioskop):**
+
+```
+Priority: [TRANSMART, CINEPOLIS, ARAYA, CGV]
+
+t=0ms   → Kirim 4 seat layout requests serentak
+t=120ms → CGV reply dulu (rank#4): ada kursi — tapi rank 1,2,3 belum reply → tunggu
+t=135ms → ARAYA reply (rank#3): ada kursi — rank 1,2 belum reply → tunggu
+t=140ms → CINEPOLIS reply (rank#2): tidak ada kursi berurutan
+t=145ms → TRANSMART reply (rank#1): tidak ada kursi berurutan
+          Semua rank < rank#3 sudah menjawab tanpa kursi
+          → ARAYA menang (rank#3) 🏆  Abort request CGV di-cancel (sudah reply sih)
+          → Checkout ARAYA
+```
+
+### Pilih Kursi (dalam satu bioskop)
+
+> ⚠️ **Orientasi baris tix.id:** Baris **A = paling BELAKANG** (terjauh dari layar). Huruf makin besar = makin dekat layar.
+
+> 📌 **Format kursi:** XXI menggunakan format nested (`seat_map` per baris), sedangkan Cinepolis/CGV menggunakan flat list dengan `seat_id` booking ID terpisah (e.g. `"2-0-3-0"`) dan `seat_grd_cd` kode tier (e.g. `"0000000013"`). Bot mendeteksi format otomatis.
 
 ```
 1. Coba manual_seats dari config (jika semua tersedia → pakai)
 2. Auto-select:
-   a. Skip avoid_first_rows baris pertama (default A,B,C)
-   b. Filter ke preferred_rows range (default D–H, boleh dibalik)
+   a. Skip avoid_first_rows baris paling DEPAN/dekat layar (huruf terbesar, default skip 3)
+   b. Filter ke preferred_rows range (default D–H = tengah studio, boleh dibalik)
    c. Urutkan baris dari tengah range ke tepi: F→E→G→D→H
-   d. Tiap baris: cari grup N kursi berurutan paling dekat tengah
-   e. Fallback: jika preferred range habis → lanjut baris tersisa
+   d. Tiap baris: cari grup N kursi BERURUTAN paling dekat tengah baris
+      — "Berurutan" = kolom numerik berdekatan DAN sisi aisle yang sama
+        (kursi di kiri/kanan lorong tengah Cinepolis tidak dianggap berurutan)
+   e. Fallback: jika preferred range habis → lanjut ke baris usable lainnya
 ```
 
 ---
@@ -275,5 +325,7 @@ tixid-bot/
 | v1.0  | ✅ Done    | Login → cari film → pilih jadwal → auto-select kursi → create order |
 | v1.1  | ✅ Done    | QRIS checkout + render QR di terminal                               |
 | v1.2  | ✅ Done    | Sniper mode (polling + `start_at` war timer)                        |
-| v1.3  | ✅ Done    | Non-blocking async file logging                                      |
-| v1.4  | 📋 Planned | Multi-account support (concurrent)                                  |
+| v1.3  | ✅ Done    | Non-blocking async file logging                                     |
+| v1.4  | ✅ Done    | Smart Seating: parallel race, winner by rank, abort losers          |
+| v1.5  | ✅ Done    | Multi-format layout (XXI/Cinepolis/CGV) + grid/aisle-aware seating  |
+| v1.6  | 📋 Planned | Multi-account support (concurrent)                                  |

@@ -221,14 +221,14 @@ pub async fn create_order(
     client: &Client,
     merchant_id: &str,
     time_show_id: &str,
-    seats: &[String],
+    seats: &[crate::models::SelectedSeat],
 ) -> Result<OrderData> {
     let seat_data = seats
         .iter()
         .map(|s| SeatData {
-            seat_id: s.clone(),
-            seat_name: s.clone(),
-            seat_grd_cd: s.clone(),
+            seat_id: s.seat_id.clone(),
+            seat_name: s.display.clone(),
+            seat_grd_cd: s.grd_cd.clone(),
         })
         .collect();
 

@@ -44,3 +44,39 @@ pub fn build(token: Option<&str>, device_id: &str) -> Result<Client> {
 
     Ok(client)
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_no_token_succeeds() {
+        assert!(build(None, "test-device-123").is_ok());
+    }
+
+    #[test]
+    fn build_with_bearer_token_succeeds() {
+        assert!(build(Some("eyJhbGciOiJIUzI1NiJ9.test.sig"), "device-abc").is_ok());
+    }
+
+    #[test]
+    fn build_empty_device_id_succeeds() {
+        assert!(build(None, "").is_ok());
+    }
+
+    #[test]
+    fn build_invalid_device_id_with_null_byte_errors() {
+        // Header values cannot contain NUL bytes
+        let result = build(None, "\x00bad-device");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_with_unicode_token_succeeds() {
+        // Tokens are ASCII (JWT), but verify UTF-8 safe tokens work too
+        let result = build(Some("valid.jwt.token"), "device-001");
+        assert!(result.is_ok());
+    }
+}

@@ -11,6 +11,12 @@ movie_id = "2039608798242488320"
 city_id = "973818515335155712"
 # Tanggal nonton (format YYYY-MM-DD). Kosongkan ("") untuk otomatis pakai tanggal pertama tersedia.
 date = ""
+# Datetime yang diblok — bot akan skip showtime dalam range ini.
+# Format: ["YYYY-MM-DD HH:MM", "YYYY-MM-DD HH:MM"] (inklusif).
+# Format tanggal saja ["YYYY-MM-DD", "YYYY-MM-DD"] juga diterima (= seluruh hari 00:00–23:59).
+# Contoh: [["2026-05-24 00:00", "2026-05-25 17:59"], ["2026-06-01", "2026-06-01"]]
+# Kosongkan [] untuk tidak memblok apapun.
+blocked_datetime_ranges = []
 
 [theater]
 # Urutan prioritas bioskop (dicoba dari atas ke bawah, substring case-insensitive)
@@ -21,9 +27,14 @@ theater_priority = [
     "ARAYA XXI",
     "MALANG CITY POINT CGV",
 ]
+# Bioskop yang selalu dilewati meski ada di priority list (substring case-insensitive).
+# Kosongkan [] untuk tidak memblok bioskop apapun.
+# Contoh: ["PREMIERE", "IMAX"]
+blocked_theaters = []
 
 [showtime]
-# Rentang jam yang diinginkan (format HH:MM, 24 jam). Kosongkan ("") untuk semua jam.
+# Rentang datetime yang diinginkan. Format "HH:MM" (hanya jam) atau "YYYY-MM-DD HH:MM" (datetime penuh).
+# Kosongkan ("") untuk tidak ada batasan.
 preferred_time_start = "12:00"
 preferred_time_end = "22:00"
 
@@ -32,7 +43,7 @@ preferred_time_end = "22:00"
 quantity = 2
 # Kursi manual (dicoba duluan jika tersedia). Kosongkan [] untuk auto-select.
 manual_seats = []
-# Lewati N baris pertama (A=0, B=1, C=2 → avoid_first_rows=3 = skip A,B,C)
+# Lewati N baris paling DEPAN/dekat layar (A=belakang/jauh, huruf besar=dekat layar → skip N terbesar)
 avoid_first_rows = 3
 # Range baris yang disukai [baris_awal, baris_akhir] inklusif. [] = semua baris tersedia.
 preferred_rows = ["D", "H"]
