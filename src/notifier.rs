@@ -36,6 +36,40 @@ pub fn fmt_rupiah(amount: i64) -> String {
     result.chars().rev().collect()
 }
 
+/// Normalize and sanitize Discord mention string.
+/// - If empty or whitespace, returns empty string.
+/// - If "@everyone" or "@here", returns as is.
+/// - If "<@...>" or "<@&...>", returns as is.
+/// - If purely numeric (e.g. "123456789012345678"), formats as "<@123456789012345678>".
+/// - If "@" followed only by digits (e.g. "@123456789012345678"), formats as "<@123456789012345678>".
+/// - If raw username (e.g. "@triadi" or "triadi"), logs a warning and leaves as is.
+pub fn normalize_discord_mention(mention: &str) -> String {
+    let trimmed = mention.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if trimmed == "@everyone" || trimmed == "@here" {
+        return trimmed.to_string();
+    }
+
+    if (trimmed.starts_with("<@") || trimmed.starts_with("<@&")) && trimmed.ends_with('>') {
+        return trimmed.to_string();
+    }
+
+    let digits_part = trimmed.strip_prefix('@').unwrap_or(trimmed);
+    if !digits_part.is_empty() && digits_part.chars().all(|c| c.is_ascii_digit()) {
+        return format!("<@{}>", digits_part);
+    }
+
+    tracing::warn!(
+        mention = %trimmed,
+        "Discord mention appears to be a username handle. Discord Webhook requires a numeric User ID format: <@USER_ID> or @everyone."
+    );
+
+    trimmed.to_string()
+}
+
 /// Build the Discord webhook JSON body.
 pub fn build_discord_payload(
     mention: &str,
@@ -110,11 +144,15 @@ pub fn build_discord_payload(
     }
 
     let mut body = json!({
-        "embeds": [embed]
+        "embeds": [embed],
+        "allowed_mentions": {
+            "parse": ["users", "roles", "everyone"]
+        }
     });
 
-    if !mention.trim().is_empty() {
-        body["content"] = json!(mention.trim());
+    let normalized_mention = normalize_discord_mention(mention);
+    if !normalized_mention.is_empty() {
+        body["content"] = json!(normalized_mention);
     }
 
     body
@@ -149,6 +187,8 @@ fn send_desktop_notification(payload: &OrderNotificationPayload) {
         .appname("TIX.ID Bot")
         .summary(&summary)
         .body(&body)
+        .urgency(notify_rust::Urgency::Critical)
+        .timeout(notify_rust::Timeout::Never)
         .show()
     {
         Ok(_) => {
@@ -281,7 +321,26 @@ mod tests {
         let json = build_discord_payload("<@&123456789>", &p);
 
         assert_eq!(json["content"], "<@&123456789>");
+        assert_eq!(
+            json["allowed_mentions"]["parse"],
+            serde_json::json!(["users", "roles", "everyone"])
+        );
         let embeds = json["embeds"].as_array().unwrap();
         assert_eq!(embeds.len(), 1);
+    }
+
+    #[test]
+    fn test_normalize_discord_mention() {
+        assert_eq!(normalize_discord_mention(""), "");
+        assert_eq!(normalize_discord_mention("   "), "");
+        assert_eq!(normalize_discord_mention("@everyone"), "@everyone");
+        assert_eq!(normalize_discord_mention("@here"), "@here");
+        assert_eq!(normalize_discord_mention("<@123456789>"), "<@123456789>");
+        assert_eq!(normalize_discord_mention("<@&987654321>"), "<@&987654321>");
+        // Raw numbers
+        assert_eq!(normalize_discord_mention("123456789"), "<@123456789>");
+        assert_eq!(normalize_discord_mention("@123456789"), "<@123456789>");
+        // Username string returns trimmed as is (with log warning)
+        assert_eq!(normalize_discord_mention("@triadi"), "@triadi");
     }
 }

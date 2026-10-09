@@ -130,7 +130,10 @@ pub fn run_setup() -> anyhow::Result<Config> {
 
     if cfg.notification.discord_enabled {
         cfg.notification.discord_webhook_url = prompt("Discord Webhook URL", &cfg.notification.discord_webhook_url);
-        cfg.notification.discord_mention = prompt("Discord Mention (opsional: @everyone, <@USER_ID>)", &cfg.notification.discord_mention);
+        println!("   💡 Tip Mention: Discord Webhook butuh ID Pengguna (bukan @username biasa).");
+        println!("      Gunakan: <@USER_ID>, angka ID, @everyone, atau @here.");
+        println!("      (Cara dapatkan ID: Aktifkan Discord Developer Mode > Klik kanan profil Anda > Salin ID Pengguna)");
+        cfg.notification.discord_mention = prompt("Discord Mention (opsional)", &cfg.notification.discord_mention);
     }
     println!();
 
