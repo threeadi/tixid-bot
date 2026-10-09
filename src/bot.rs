@@ -24,17 +24,34 @@ pub async fn run() -> Result<()> {
 
     // ── 1. Load config ───────────────────────────────────────────────────────
     let mut cfg = config::load()?;
-    wait_until_start(&cfg.polling.start_at).await?;
 
-    let bot_start = Instant::now();
-
-    // ── 2. Auth: guest token → login ────────────────────────────────────────
+    // ── 2. Pre-Authentication (Strategi A) ──────────────────────────────────
+    // Login SEBELUM standby agar token dan koneksi TCP/TLS sudah siap saat war!
     let mut auth = authenticate(&cfg).await?;
 
-    // ── 3. Poll until movie schedule/showtime is ready ──────────────────────
-    let (movie, target_date, ranked) = wait_for_target_showtime(&mut cfg, &mut auth).await?;
+    // ── 3. Pre-fetch & Cache Movie Metadata (Strategi B) ────────────────────
+    let clean_id = clean_movie_id(&cfg.target.movie_id);
+    print!("🎥 Pre-fetching movie {}...", clean_id);
+    let mut movie = api::get_movie(&auth.http, &clean_id).await?;
+    if movie.id.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "Film tidak ditemukan di TIX ID (ID '{}' tidak menghasilkan data). Pastikan movie_id berupa ID film yang benar (contoh: 2093187333460410368).",
+            cfg.target.movie_id
+        ));
+    }
+    println!(
+        "\r✅ {} ({} min, {})               ",
+        movie.name, movie.duration, movie.status
+    );
 
-    // ── 4 & 5. Find theater with N consecutive seats (try in priority order) ─
+    // ── 4. Standby jika polling.start_at disetel (Pre-authenticated & Warm) ──
+    wait_until_start_with_keepalive(&cfg, &mut auth, &cfg.polling.start_at).await?;
+
+    // ── 5. Poll until movie showtime is ready (Bypass redundant metadata) ────
+    let (target_date, ranked, strike_start) =
+        wait_for_target_showtime(&mut cfg, &mut auth, &mut movie).await?;
+
+    // ── 6 & 7. Find theater with N consecutive seats (parallel) ──────────────
     let (selected, layout, seats) =
         try_theaters_for_seats(&auth.http, &cfg, &ranked).await?;
 
@@ -78,8 +95,8 @@ pub async fn run() -> Result<()> {
     println!("💺 Selected seats: {}", seats.iter().map(|s| s.display.as_str()).collect::<Vec<_>>().join(", "));
     tracing::info!(seats = %seats.iter().map(|s| s.display.as_str()).collect::<Vec<_>>().join(", "), theater = %selected.theater.name, "seats selected");
 
-    // ── 6. Create order ───────────────────────────────────────────────────────
-    println!("\n🛒 Placing order...");
+    // ── 8. Create order (Lock seats) ─────────────────────────────────────────
+    println!("\n🛒 Placing order (Locking seats)...");
     let order = api::create_order(
         &auth.http,
         &selected.theater.merchant.merchant_id,
@@ -87,6 +104,8 @@ pub async fn run() -> Result<()> {
         &seats,
     )
     .await?;
+
+    let seat_lock_elapsed = strike_start.elapsed();
 
     // Format expiry time in WIB (UTC+7)
     let wib = FixedOffset::east_opt(7 * 3600).unwrap();
@@ -104,7 +123,7 @@ pub async fn run() -> Result<()> {
 
     println!();
     println!("========================================");
-    println!("🎉 ORDER SUCCESSFUL!");
+    println!("🎉 ORDER SUCCESSFUL! (SEATS LOCKED)");
     println!("========================================");
     println!("   Order ID:  {}", order.id);
     println!("   Movie:     {}", order.movie_name);
@@ -131,8 +150,11 @@ pub async fn run() -> Result<()> {
         fee = order.convenience_fee,
         total = order.total,
         expires_at = order.expired_at,
-        "order created"
+        seat_lock_ms = seat_lock_elapsed.as_millis(),
+        "order created (seats locked)"
     );
+
+    // ── 9. Checkout ──────────────────────────────────────────────────────────
     print!("💳 Checking out with {}...", cfg.payment.payment_option);
     let payment = api::checkout(
         &auth.http,
@@ -144,18 +166,18 @@ pub async fn run() -> Result<()> {
     )
     .await?;
     println!("\r✅ Checkout OK                               ");
-    let elapsed = bot_start.elapsed();
-    let elapsed_str = if elapsed.as_secs() >= 60 {
-        format!("{}m {:.3}s", elapsed.as_secs() / 60, (elapsed.as_millis() % 60_000) as f64 / 1000.0)
-    } else {
-        format!("{:.3}s", elapsed.as_secs_f64())
-    };
+
+    let total_elapsed = strike_start.elapsed();
+    let seat_lock_str = format!("{:.3}s", seat_lock_elapsed.as_secs_f64());
+    let total_str = format!("{:.3}s", total_elapsed.as_secs_f64());
+
     tracing::info!(
         order_id = %order.id,
         payment_option = %payment.payment_option,
         total = payment.total_payment,
         payment_code = %payment.payment_code,
-        elapsed_ms = elapsed.as_millis(),
+        seat_lock_ms = seat_lock_elapsed.as_millis(),
+        total_ms = total_elapsed.as_millis(),
         "checkout completed"
     );
     println!();
@@ -164,7 +186,8 @@ pub async fn run() -> Result<()> {
     println!("========================================");
     println!("   Method:    {}", payment.payment_option);
     println!("   Amount:    Rp{}", fmt_rupiah(payment.total_payment));
-    println!("   ⏱️  Total time: {}", elapsed_str);
+    println!("   ⚡ Seat Lock Time: {} (Waktu Penguncian Kursi)", seat_lock_str);
+    println!("   ⏱️  Total Checkout: {} (Termasuk QRIS Gateway)", total_str);
     if !payment.checkout_url.is_empty() {
         println!("   URL:       {}", payment.checkout_url);
     }
@@ -298,6 +321,45 @@ async fn wait_until_start(start_at: &str) -> Result<()> {
     Ok(())
 }
 
+/// Standby until `polling.start_at` with pre-authenticated warm connection and auto token refresh.
+async fn wait_until_start_with_keepalive(
+    cfg: &config::Config,
+    auth: &mut AuthSession,
+    start_at: &str,
+) -> Result<()> {
+    let start_at = start_at.trim();
+    if start_at.is_empty() {
+        return Ok(());
+    }
+
+    let naive = NaiveDateTime::parse_from_str(start_at, "%Y-%m-%d %H:%M:%S")
+        .with_context(|| format!("Invalid polling.start_at format: {}", start_at))?;
+    let wib = wib();
+    let start = wib
+        .from_local_datetime(&naive)
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("Cannot resolve polling.start_at in WIB: {}", start_at))?;
+    let now = Utc::now().with_timezone(&wib);
+
+    if start > now {
+        let wait_secs = (start - now).num_seconds().max(0) as u64;
+        println!(
+            "⏳ Standby until {} WIB ({}s) [Pre-authenticated & Warm Socket]...",
+            start.format("%Y-%m-%d %H:%M:%S"),
+            wait_secs
+        );
+        while Utc::now().with_timezone(&wib) < start {
+            let remaining = (start - Utc::now().with_timezone(&wib)).num_seconds().max(0) as u64;
+            let sleep_step = remaining.min(5);
+            sleep(Duration::from_secs(sleep_step)).await;
+            refresh_auth_if_needed(cfg, auth).await?;
+        }
+        println!("🚀 Waktu war telah tiba! Memulai serangan tiket...");
+    }
+
+    Ok(())
+}
+
 /// Fire ALL seat layout requests in parallel, then resolve to the highest-ranked
 /// theater that has N consecutive seats.
 ///
@@ -420,28 +482,30 @@ async fn try_theaters_for_seats(
 async fn wait_for_target_showtime(
     cfg: &mut config::Config,
     auth: &mut AuthSession,
-) -> Result<(crate::models::MovieData, String, Vec<theater_selector::SelectedShowtime>)> {
+    movie: &mut crate::models::MovieData,
+) -> Result<(String, Vec<theater_selector::SelectedShowtime>, Instant)> {
     let mut last_modified = None;
+    let mut current_movie_id = clean_movie_id(&cfg.target.movie_id);
+
     loop {
         // Cek jika config.toml diedit di background saat standby/polling
         config::check_and_reload(&mut last_modified, cfg);
 
+        // Jika user mengubah movie_id di config.toml secara live
+        let clean_id = clean_movie_id(&cfg.target.movie_id);
+        if clean_id != current_movie_id {
+            print!("🎥 Fetching updated movie {}...", clean_id);
+            let updated = api::get_movie(&auth.http, &clean_id).await?;
+            if !updated.id.trim().is_empty() {
+                *movie = updated;
+                current_movie_id = clean_id;
+                println!("\r✅ Live reload: {} ({})          ", movie.name, movie.status);
+            }
+        }
+
         refresh_auth_if_needed(cfg, auth).await?;
 
-        let clean_id = clean_movie_id(&cfg.target.movie_id);
-        print!("🎥 Fetching movie {}...", clean_id);
-        let movie = api::get_movie(&auth.http, &clean_id).await?;
-        if movie.id.trim().is_empty() {
-            return Err(anyhow::anyhow!(
-                "Film tidak ditemukan di TIX ID (ID '{}' tidak menghasilkan data). Pastikan movie_id berupa ID film yang benar (contoh: 2093187333460410368).",
-                cfg.target.movie_id
-            ));
-        }
-        println!(
-            "\r✅ {} ({} min, {})               ",
-            movie.name, movie.duration, movie.status
-        );
-
+        // Jika film masih upcoming, tunggu polling
         if movie.status.eq_ignore_ascii_case("UPCOMING") {
             let release = movie
                 .release_date
@@ -455,42 +519,63 @@ async fn wait_for_target_showtime(
                 ),
             )
             .await?;
+            // Coba fetch status film lagi untuk mengecek apakah sudah NOW_PLAYING
+            if let Ok(updated) = api::get_movie(&auth.http, &current_movie_id).await {
+                if !updated.id.trim().is_empty() {
+                    *movie = updated;
+                }
+            }
             continue;
         }
 
-        let dates = match api::get_schedule_dates(&auth.http, &movie.id, &cfg.target.city_id).await?
-        {
-            Some(dates) => dates,
-            None => {
-                wait_or_fail(cfg, "Schedule belum tersedia (DATA_NOT_FOUND).").await?;
+        // Tentukan target_date:
+        // Strategi B: Jika target.date sudah diisi di config.toml, langsung gunakan (tanpa hit get_schedule_dates)!
+        let target_date = if !cfg.target.date.trim().is_empty() {
+            cfg.target.date.trim().to_string()
+        } else {
+            // Jika tanggal kosong di config, ambil daftar tanggal aktif
+            let dates = match api::get_schedule_dates(&auth.http, &movie.id, &cfg.target.city_id).await? {
+                Some(dates) => dates,
+                None => {
+                    wait_or_fail(cfg, "Schedule belum tersedia (DATA_NOT_FOUND).").await?;
+                    continue;
+                }
+            };
+            match pick_target_date(cfg, &dates) {
+                Some(d) => d,
+                None => {
+                    wait_or_fail(cfg, "Belum ada tanggal schedule yang aktif.").await?;
+                    continue;
+                }
+            }
+        };
+
+        // War Strike Measurement: mulai tepat saat request jadwal jam ditembak
+        let strike_start = Instant::now();
+        print!("🏟️  Checking schedules for {}...", target_date);
+        let schedules = match api::get_showtimes(&auth.http, &movie.id, &cfg.target.city_id, &target_date).await {
+            Ok(s) => s,
+            Err(e) => {
+                wait_or_fail(cfg, &format!("Jadwal belum tersedia: {}", e)).await?;
                 continue;
             }
         };
 
-        let target_date = match pick_target_date(cfg, &dates) {
-            Some(date) => date,
-            None => {
-                let msg = if cfg.target.date.is_empty() {
-                    "Belum ada tanggal schedule yang aktif."
-                } else {
-                    "Tanggal target belum tersedia di schedule."
-                };
-                wait_or_fail(cfg, msg).await?;
-                continue;
-            }
-        };
-
-        print!("🏟️  Getting schedules for {}...", target_date);
-        let schedules =
-            api::get_showtimes(&auth.http, &movie.id, &cfg.target.city_id, &target_date).await?;
         println!(
             "\r✅ Found {} theater(s)                 ",
             schedules.theaters.len()
         );
 
-        let ranked = theater_selector::rank(&schedules.theaters, &cfg.theater, &cfg.showtime, &target_date, &cfg.target.blocked_datetime_ranges);
+        let ranked = theater_selector::rank(
+            &schedules.theaters,
+            &cfg.theater,
+            &cfg.showtime,
+            &target_date,
+            &cfg.target.blocked_datetime_ranges,
+        );
+
         if !ranked.is_empty() {
-            return Ok((movie, target_date, ranked));
+            return Ok((target_date, ranked, strike_start));
         }
 
         wait_or_fail(

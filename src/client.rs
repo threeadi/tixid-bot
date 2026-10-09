@@ -38,6 +38,9 @@ pub fn build(token: Option<&str>, device_id: &str) -> Result<Client> {
     }
 
     let client = Client::builder()
+        .tcp_nodelay(true)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(10)
         .default_headers(headers)
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
