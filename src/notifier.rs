@@ -37,37 +37,49 @@ pub fn fmt_rupiah(amount: i64) -> String {
 }
 
 /// Normalize and sanitize Discord mention string.
-/// - If empty or whitespace, returns empty string.
-/// - If "@everyone" or "@here", returns as is.
-/// - If "<@...>" or "<@&...>", returns as is.
-/// - If purely numeric (e.g. "123456789012345678"), formats as "<@123456789012345678>".
-/// - If "@" followed only by digits (e.g. "@123456789012345678"), formats as "<@123456789012345678>".
-/// - If raw username (e.g. "@triadi" or "triadi"), logs a warning and leaves as is.
+/// Supports single or multiple mentions separated by commas, semicolons, or whitespace.
+/// Converts numeric IDs (with or without '@') to '<@ID>', preserves '<@...>', '<@&...>',
+/// '@everyone', and '@here'.
 pub fn normalize_discord_mention(mention: &str) -> String {
     let trimmed = mention.trim();
     if trimmed.is_empty() {
         return String::new();
     }
 
-    if trimmed == "@everyone" || trimmed == "@here" {
-        return trimmed.to_string();
+    // Split tokens by comma, semicolon, or whitespace
+    let tokens: Vec<&str> = trimmed
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if tokens.is_empty() {
+        return String::new();
     }
 
-    if (trimmed.starts_with("<@") || trimmed.starts_with("<@&")) && trimmed.ends_with('>') {
-        return trimmed.to_string();
+    let mut normalized_tokens = Vec::with_capacity(tokens.len());
+
+    for token in tokens {
+        if token == "@everyone" || token == "@here" {
+            normalized_tokens.push(token.to_string());
+        } else if (token.starts_with("<@") || token.starts_with("<@&")) && token.ends_with('>') {
+            normalized_tokens.push(token.to_string());
+        } else {
+            let digits_part = token.strip_prefix('@').unwrap_or(token);
+            if !digits_part.is_empty() && digits_part.chars().all(|c| c.is_ascii_digit()) {
+                normalized_tokens.push(format!("<@{}>", digits_part));
+            } else {
+                tracing::warn!(
+                    mention = %token,
+                    "Discord mention '{}' appears to be a username handle. Discord Webhook requires a numeric User ID format: <@USER_ID> or @everyone.",
+                    token
+                );
+                normalized_tokens.push(token.to_string());
+            }
+        }
     }
 
-    let digits_part = trimmed.strip_prefix('@').unwrap_or(trimmed);
-    if !digits_part.is_empty() && digits_part.chars().all(|c| c.is_ascii_digit()) {
-        return format!("<@{}>", digits_part);
-    }
-
-    tracing::warn!(
-        mention = %trimmed,
-        "Discord mention appears to be a username handle. Discord Webhook requires a numeric User ID format: <@USER_ID> or @everyone."
-    );
-
-    trimmed.to_string()
+    normalized_tokens.join(" ")
 }
 
 /// Build the Discord webhook JSON body.
@@ -340,6 +352,23 @@ mod tests {
         // Raw numbers
         assert_eq!(normalize_discord_mention("123456789"), "<@123456789>");
         assert_eq!(normalize_discord_mention("@123456789"), "<@123456789>");
+        // Multiple mentions with commas and @
+        assert_eq!(
+            normalize_discord_mention("@407480862545018881, @689971343042936867"),
+            "<@407480862545018881> <@689971343042936867>"
+        );
+        assert_eq!(
+            normalize_discord_mention("407480862545018881, 689971343042936867"),
+            "<@407480862545018881> <@689971343042936867>"
+        );
+        assert_eq!(
+            normalize_discord_mention("<@407480862545018881>, <@689971343042936867>"),
+            "<@407480862545018881> <@689971343042936867>"
+        );
+        assert_eq!(
+            normalize_discord_mention("@everyone, @407480862545018881"),
+            "@everyone <@407480862545018881>"
+        );
         // Username string returns trimmed as is (with log warning)
         assert_eq!(normalize_discord_mention("@triadi"), "@triadi");
     }

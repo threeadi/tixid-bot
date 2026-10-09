@@ -293,6 +293,7 @@ async fn refresh_auth_if_needed(cfg: &config::Config, auth: &mut AuthSession) ->
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn wait_until_start(start_at: &str) -> Result<()> {
     let start_at = start_at.trim();
     if start_at.is_empty() {
