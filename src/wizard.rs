@@ -74,11 +74,24 @@ pub fn run_setup() -> anyhow::Result<Config> {
 
     // ── 2. Target ─────────────────────────────────────────
     println!("🎯 [2/5] Target Film & Jadwal");
-    cfg.target.movie_id = prompt("Movie ID (dari URL / API tix.id)", &cfg.target.movie_id);
+    let raw_movie_id = prompt("Movie ID (angka dari URL / API tix.id)", &cfg.target.movie_id);
+    cfg.target.movie_id = crate::bot::clean_movie_id(&raw_movie_id);
     cfg.target.city_id = prompt("City ID (ID Kota)", &cfg.target.city_id);
     cfg.target.date = prompt("Tanggal nonton (YYYY-MM-DD, kosong = otomatis)", &cfg.target.date);
-    cfg.showtime.preferred_time_start = prompt("Jam mulai paling awal (contoh: 12:00)", &cfg.showtime.preferred_time_start);
-    cfg.showtime.preferred_time_end = prompt("Jam selesai paling akhir (contoh: 22:00)", &cfg.showtime.preferred_time_end);
+
+    let default_start = if cfg.showtime.preferred_time_start.contains(' ') {
+        cfg.showtime.preferred_time_start.split_whitespace().last().unwrap_or("12:00").to_string()
+    } else {
+        cfg.showtime.preferred_time_start.clone()
+    };
+    let default_end = if cfg.showtime.preferred_time_end.contains(' ') {
+        cfg.showtime.preferred_time_end.split_whitespace().last().unwrap_or("22:00").to_string()
+    } else {
+        cfg.showtime.preferred_time_end.clone()
+    };
+
+    cfg.showtime.preferred_time_start = prompt("Jam mulai paling awal (contoh: 12:00)", &default_start);
+    cfg.showtime.preferred_time_end = prompt("Jam selesai paling akhir (contoh: 22:00)", &default_end);
     println!();
 
     // ── 3. Kursi ──────────────────────────────────────────

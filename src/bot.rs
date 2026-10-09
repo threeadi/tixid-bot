@@ -428,8 +428,15 @@ async fn wait_for_target_showtime(
 
         refresh_auth_if_needed(cfg, auth).await?;
 
-        print!("🎥 Fetching movie {}...", cfg.target.movie_id);
-        let movie = api::get_movie(&auth.http, &cfg.target.movie_id).await?;
+        let clean_id = clean_movie_id(&cfg.target.movie_id);
+        print!("🎥 Fetching movie {}...", clean_id);
+        let movie = api::get_movie(&auth.http, &clean_id).await?;
+        if movie.id.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Film tidak ditemukan di TIX ID (ID '{}' tidak menghasilkan data). Pastikan movie_id berupa ID film yang benar (contoh: 2093187333460410368).",
+                cfg.target.movie_id
+            ));
+        }
         println!(
             "\r✅ {} ({} min, {})               ",
             movie.name, movie.duration, movie.status
@@ -491,6 +498,23 @@ async fn wait_for_target_showtime(
             "Schedule sudah ada, tapi belum ada showtime yang cocok dengan filter theater/time.",
         )
         .await?;
+    }
+}
+
+pub fn clean_movie_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // Jika user paste URL atau slug seperti "hasut-2093187333460410368"
+    for part in trimmed.rsplit(|c| c == '/' || c == '-' || c == '?' || c == '#') {
+        if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) && part.len() >= 10 {
+            return part.to_string();
+        }
+    }
+    // Fallback: ambil semua digit jika ada
+    let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() >= 10 {
+        digits
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -821,5 +845,33 @@ mod tests {
             authenticated_at: std::time::Instant::now(),
         };
         assert!(refresh_auth_if_needed(&cfg, &mut auth).await.is_ok());
+    }
+
+    // ── clean_movie_id ───────────────────────────────────────────────────
+
+    #[test]
+    fn clean_movie_id_plain_numeric() {
+        assert_eq!(clean_movie_id("2093187333460410368"), "2093187333460410368");
+    }
+
+    #[test]
+    fn clean_movie_id_with_slug_prefix() {
+        assert_eq!(clean_movie_id("hasut-2093187333460410368"), "2093187333460410368");
+    }
+
+    #[test]
+    fn clean_movie_id_with_full_url() {
+        assert_eq!(
+            clean_movie_id("https://www.tix.id/movie/hasut-2093187333460410368"),
+            "2093187333460410368"
+        );
+    }
+
+    #[test]
+    fn clean_movie_id_with_url_query_param() {
+        assert_eq!(
+            clean_movie_id("https://tix.id/movie/hasut-2093187333460410368?ref=share"),
+            "2093187333460410368"
+        );
     }
 }
