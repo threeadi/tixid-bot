@@ -36,6 +36,26 @@ async fn main() -> anyhow::Result<()> {
 
     // Check CLI flags
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("tixid-bot v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("🎬 tixid-bot v{}", env!("CARGO_PKG_VERSION"));
+        println!("Bot otomatis tiket bioskop TIX ID (High-speed War & Beacon)");
+        println!();
+        println!("PENGGUNAAN:");
+        println!("  tixid-bot.exe [FLAGS]");
+        println!();
+        println!("FLAGS:");
+        println!("  -v, --verbose           Tampilkan metrik rincian HTTP timing & CPU/RAM");
+        println!("  -s, --setup             Jalankan Interactive Full Setup Wizard");
+        println!("  -y, --no-interactive    Jalankan bot langsung tanpa menu interaktif");
+        println!("  -V, --version           Tampilkan nomor versi bot");
+        println!("  -h, --help              Tampilkan bantuan perintah");
+        return Ok(());
+    }
+
     let verbose_cli = args.iter().any(|a| a == "--verbose" || a == "-v");
     let cfg_initial = config::load().unwrap_or_default();
     api::set_verbose_timing(verbose_cli || cfg_initial.debug.verbose_timing);
@@ -68,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
         api::set_verbose_timing(verbose_cli || cfg.debug.verbose_timing);
 
         println!();
-        println!("🎬 TIX.ID Bot [v1.0.0-beta]");
+        println!("🎬 TIX.ID Bot [v{}]", env!("CARGO_PKG_VERSION"));
         println!("--------------------------------------------------");
         wizard::print_config_status(&cfg);
         println!("--------------------------------------------------");

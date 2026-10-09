@@ -781,7 +781,7 @@ tixid-bot/
 
 | Versi                                          | Fitur                                                                              |
 | ---------------------------------------------- | ---------------------------------------------------------------------------------- |
-| ✅ **v1.0.0-beta**                             | Initial Feature Set: Core Bot, QRIS Checkout, Sniper Mode, Async Logging, Smart Seating (Parallel Race), Multi-format Layout (XXI/Cinepolis/CGV), Notifikasi (Windows Toast, Beep, Discord Webhook), Interactive Setup Wizard & Live Hot-Reload, Beaconing Mode, Verbose HTTP Timing Diagnostics (Network RTT vs Server Upstream vs Transfer) |
+| ✅ **v1.0.0**                                  | Release 1.0: Core Bot, QRIS Checkout, Sniper Mode, Async Logging, Smart Seating with Auto Seat Re-Roll, Multi-Date Priority, Multi-format Layout (XXI/Cinepolis/CGV), Notifikasi (Windows Toast, Beep, Discord Webhook), Interactive Setup Wizard & Live Hot-Reload, Beaconing Mode, Verbose HTTP Timing Diagnostics (Network RTT vs Server Upstream vs Transfer) & CPU/RAM Resource Tracking |
 | 🔲 **v1.1.0**                                  | Multi-account support (concurrent)                                                 |
 
 ---

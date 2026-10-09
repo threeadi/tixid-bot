@@ -6,7 +6,7 @@ Target: secepat mungkin dari start → seat hold → QRIS payment.
 
 ---
 
-## ✅ Fitur (v1.0.0-beta)
+## ✅ Fitur (v1.0.0)
 
 ### 🚀 Core Bot & Automation
 - [x] `src/config.rs` — Load, save, & parse `config.toml` (termasuk `theater_priority`, geolokasi, dll)
@@ -325,5 +325,5 @@ tixid-bot/
 
 | Versi | Status     | Fitur                                                               |
 | ----- | ---------- | ------------------------------------------------------------------- |
-| v1.0.0-beta | ✅ Done | Core Bot, QRIS Checkout, Sniper Mode, Async Logging, Smart Seating, Multi-format Layout, Notifikasi Multi-channel, Interactive Wizard & Live Hot-Reload |
+| v1.0.0 | ✅ Done | Core Bot, QRIS Checkout, Sniper Mode, Async Logging, Smart Seating (Auto Seat Re-Roll), Multi-Date Priority, Multi-format Layout, Notifikasi Multi-channel, Interactive Wizard & Live Hot-Reload, Verbose Timing & Metrics |
 | v1.1.0 | 📋 Planned | Multi-account support (concurrent)                                  |

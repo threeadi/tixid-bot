@@ -21,7 +21,7 @@ struct AuthSession {
 
 pub async fn run() -> Result<()> {
     tracing::info!("bot starting");
-    println!("🎬 TIX.ID Bot");
+    println!("🎬 TIX.ID Bot [v{}]", env!("CARGO_PKG_VERSION"));
     println!("========================================");
 
     // ── 1. Load config ───────────────────────────────────────────────────────
