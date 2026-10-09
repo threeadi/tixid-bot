@@ -264,6 +264,126 @@ pub async fn notify_checkout(cfg: &NotificationConfig, payload: &OrderNotificati
     }
 }
 
+/// Send notification when a movie is discovered in the catalog via Beacon mode.
+pub async fn notify_beacon_found(
+    cfg: &NotificationConfig,
+    query_title: &str,
+    matched_title: &str,
+    movie_id: &str,
+    similarity: f64,
+    status: &str,
+    next_action: &str,
+) {
+    if cfg.desktop_sound {
+        play_desktop_sound();
+    }
+
+    if cfg.desktop_enabled {
+        let summary = "📡 TIX.ID — Film Ditemukan! (Beacon)".to_string();
+        let body = format!(
+            "Pencarian: {}\nFilm: {}\nMovie ID: {}\nKemiripan: {:.0}%\nStatus: {}\n{}",
+            query_title,
+            matched_title,
+            movie_id,
+            similarity * 100.0,
+            status,
+            next_action
+        );
+        let _ = notify_rust::Notification::new()
+            .appname("TIX.ID Bot")
+            .summary(&summary)
+            .body(&body)
+            .urgency(notify_rust::Urgency::Normal)
+            .timeout(notify_rust::Timeout::Milliseconds(8000))
+            .show();
+    }
+
+    if cfg.discord_enabled && !cfg.discord_webhook_url.trim().is_empty() {
+        let client = reqwest::Client::new();
+        let embed = json!({
+            "title": "📡 Film Ditemukan di Katalog TIX.ID! (Beacon Mode)",
+            "description": format!("Bot berhasil menemukan film yang cocok dengan target `{}`.", query_title),
+            "color": 3447003,
+            "fields": [
+                { "name": "🎬 Judul Film", "value": matched_title, "inline": true },
+                { "name": "🆔 Movie ID", "value": movie_id, "inline": true },
+                { "name": "🎯 Kemiripan", "value": format!("{:.1}%", similarity * 100.0), "inline": true },
+                { "name": "📌 Status", "value": status, "inline": true },
+                { "name": "⚡ Aksi Berikutnya", "value": next_action, "inline": false }
+            ],
+            "footer": {
+                "text": "TIX.ID Ticket Bot • Beaconing System"
+            },
+            "timestamp": Utc::now().to_rfc3339()
+        });
+
+        let mut body = json!({
+            "embeds": [embed],
+            "allowed_mentions": { "parse": ["users", "roles", "everyone"] }
+        });
+        let normalized = normalize_discord_mention(&cfg.discord_mention);
+        if !normalized.is_empty() {
+            body["content"] = json!(normalized);
+        }
+        let _ = client.post(&cfg.discord_webhook_url).json(&body).send().await;
+    }
+}
+
+/// Send notification when presale showtimes open for a beacon-tracked movie.
+pub async fn notify_beacon_presale_opened(
+    cfg: &NotificationConfig,
+    movie_name: &str,
+    movie_id: &str,
+    target_date: &str,
+) {
+    if cfg.desktop_sound {
+        play_desktop_sound();
+    }
+
+    if cfg.desktop_enabled {
+        let summary = "⚡ TIX.ID — Jadwal Presale Terbuka!".to_string();
+        let body = format!(
+            "Film: {}\nTanggal: {}\nMovie ID: {}\nBot segera meluncurkan War Checkout!",
+            movie_name, target_date, movie_id
+        );
+        let _ = notify_rust::Notification::new()
+            .appname("TIX.ID Bot")
+            .summary(&summary)
+            .body(&body)
+            .urgency(notify_rust::Urgency::Critical)
+            .timeout(notify_rust::Timeout::Never)
+            .show();
+    }
+
+    if cfg.discord_enabled && !cfg.discord_webhook_url.trim().is_empty() {
+        let client = reqwest::Client::new();
+        let embed = json!({
+            "title": "⚡ Jadwal / Presale Tiket Telah Dibuka!",
+            "description": format!("Jadwal tayang untuk **{}** sudah tersedia. Memulai proses War Checkout...", movie_name),
+            "color": 15105570,
+            "fields": [
+                { "name": "🎬 Film", "value": movie_name, "inline": true },
+                { "name": "📅 Tanggal Tayang", "value": target_date, "inline": true },
+                { "name": "🆔 Movie ID", "value": movie_id, "inline": true }
+            ],
+            "footer": {
+                "text": "TIX.ID Ticket Bot • War Alert"
+            },
+            "timestamp": Utc::now().to_rfc3339()
+        });
+
+        let mut body = json!({
+            "embeds": [embed],
+            "allowed_mentions": { "parse": ["users", "roles", "everyone"] }
+        });
+        let normalized = normalize_discord_mention(&cfg.discord_mention);
+        if !normalized.is_empty() {
+            body["content"] = json!(normalized);
+        }
+        let _ = client.post(&cfg.discord_webhook_url).json(&body).send().await;
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

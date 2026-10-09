@@ -54,28 +54,66 @@ fn prompt_usize(label: &str, current: usize) -> usize {
     val_str.parse().unwrap_or(current)
 }
 
-/// Run interactive setup wizard and save configuration to disk.
-pub fn run_setup() -> anyhow::Result<Config> {
-    println!();
-    println!("====================================================");
-    println!("⚙️  TIX.ID Bot — Setup Wizard");
-    println!("====================================================");
-    println!("Tekan ENTER langsung untuk mempertahankan nilai [default].");
-    println!();
+/// Menampilkan status ringkas konfigurasi aktif saat ini di layar menu.
+pub fn print_config_status(cfg: &Config) {
+    let clean_id = crate::bot::clean_movie_id(&cfg.target.movie_id);
+    let mode_str = if !clean_id.is_empty() {
+        format!("WAR LANGSUNG (Movie ID: {})", clean_id)
+    } else if !cfg.target.movie_title.trim().is_empty() {
+        format!("BEACONING (Judul: \"{}\" • Cek: {}m)", cfg.target.movie_title.trim(), cfg.polling.beacon_interval_mins)
+    } else {
+        "(Belum dikonfigurasi)".to_string()
+    };
 
-    // Load existing config if available, otherwise use defaults
-    let mut cfg = config::load().unwrap_or_default();
+    let date_str = if cfg.target.date.trim().is_empty() {
+        "Otomatis (hari pertama)"
+    } else {
+        cfg.target.date.trim()
+    };
 
-    // ── 1. Auth ───────────────────────────────────────────
-    println!("🔑 [1/5] Akun TIX.ID");
-    cfg.auth.msisdn = prompt("Nomor HP (+628...)", &cfg.auth.msisdn);
-    cfg.auth.password = prompt("Password token (RSA encrypted dari DevTools)", &cfg.auth.password);
+    let time_str = format!(
+        "{} - {}",
+        if cfg.showtime.preferred_time_start.is_empty() { "Awal" } else { &cfg.showtime.preferred_time_start },
+        if cfg.showtime.preferred_time_end.is_empty() { "Akhir" } else { &cfg.showtime.preferred_time_end }
+    );
+
+    println!("   Status Target : {}", mode_str);
+    println!("   Kota & Tanggal: ID {} • {}", cfg.target.city_id, date_str);
+    println!("   Preferensi    : {} Tiket • Jam {}", cfg.seat.quantity, time_str);
+}
+
+/// Prompt terpadu untuk memilih Mode War Langsung vs Mode Beaconing serta detail target film.
+fn prompt_target_mode(cfg: &mut Config) {
+    let current_mode = if !crate::bot::clean_movie_id(&cfg.target.movie_id).is_empty() {
+        "1"
+    } else {
+        "2"
+    };
+
+    println!("   Pilih Mode Operasi:");
+    println!("     [1] Mode War Langsung (Sudah punya Movie ID / Presale aktif)");
+    println!("     [2] Mode Beacon (Cari film belum rilis berdasarkan judul)");
+    print!("   Pilihan mode [1/2] [default: {}]: ", current_mode);
+    let _ = io::stdout().flush();
+
+    let mut mode_input = String::new();
+    let _ = io::stdin().read_line(&mut mode_input);
+    let mode_choice = mode_input.trim();
+    let chosen_mode = if mode_choice.is_empty() { current_mode } else { mode_choice };
+
     println!();
+    if chosen_mode == "2" {
+        println!("   📡 Setup Mode Beacon (Pencarian Katalog Otomatis):");
+        cfg.target.movie_id = String::new(); // kosongkan ID agar masuk Beacon
+        cfg.target.movie_title = prompt("Judul film (contoh: Avenger Doomsday)", &cfg.target.movie_title);
+        cfg.polling.beacon_interval_mins = prompt_usize("Interval cek berkala (menit)", cfg.polling.beacon_interval_mins as usize) as u64;
+    } else {
+        println!("   ⚡ Setup Mode War Langsung:");
+        cfg.target.movie_title = String::new(); // kosongkan judul agar langsung war
+        let raw_movie_id = prompt("Movie ID (angka dari URL tix.id)", &cfg.target.movie_id);
+        cfg.target.movie_id = crate::bot::clean_movie_id(&raw_movie_id);
+    }
 
-    // ── 2. Target ─────────────────────────────────────────
-    println!("🎯 [2/5] Target Film & Jadwal");
-    let raw_movie_id = prompt("Movie ID (angka dari URL / API tix.id)", &cfg.target.movie_id);
-    cfg.target.movie_id = crate::bot::clean_movie_id(&raw_movie_id);
     cfg.target.city_id = prompt("City ID (ID Kota)", &cfg.target.city_id);
     cfg.target.date = prompt("Tanggal nonton (YYYY-MM-DD, kosong = otomatis)", &cfg.target.date);
 
@@ -92,6 +130,65 @@ pub fn run_setup() -> anyhow::Result<Config> {
 
     cfg.showtime.preferred_time_start = prompt("Jam mulai paling awal (contoh: 12:00)", &default_start);
     cfg.showtime.preferred_time_end = prompt("Jam selesai paling akhir (contoh: 22:00)", &default_end);
+}
+
+/// Menampilkan ringkasan konfigurasi, menyimpan ke disk, dan menanyakan apakah ingin langsung jalan.
+fn print_summary_and_confirm(cfg: &Config) -> anyhow::Result<bool> {
+    println!();
+    println!("----------------------------------------------------");
+    println!("📋 Ringkasan Konfigurasi:");
+    print_config_status(cfg);
+    println!("----------------------------------------------------");
+
+    config::save(cfg)?;
+    println!("✅ Pengaturan berhasil disimpan ke: {}", config::get_config_path().display());
+    println!();
+
+    print!("Langsung mulai bot sekarang? [Y/n]: ");
+    let _ = io::stdout().flush();
+    let mut ans = String::new();
+    let _ = io::stdin().read_line(&mut ans);
+    let trimmed = ans.trim().to_lowercase();
+    let run_now = trimmed.is_empty() || trimmed == "y" || trimmed == "yes";
+
+    Ok(run_now)
+}
+
+/// Quick Setup: Hanya mengganti target film dan mode operasi tanpa mengulang Akun, Bioskop, Kursi.
+pub fn run_quick_setup() -> anyhow::Result<bool> {
+    println!();
+    println!("====================================================");
+    println!("🎯 Quick Setup — Target Film & Mode");
+    println!("====================================================");
+    println!("Tekan ENTER langsung untuk mempertahankan nilai [default].");
+    println!();
+
+    let mut cfg = config::load().unwrap_or_default();
+    prompt_target_mode(&mut cfg);
+
+    print_summary_and_confirm(&cfg)
+}
+
+/// Full Setup Wizard: Mengatur seluruh konfigurasi dari Akun sampai Notifikasi secara lengkap.
+pub fn run_setup() -> anyhow::Result<bool> {
+    println!();
+    println!("====================================================");
+    println!("⚙️  TIX.ID Bot — Full Setup Wizard");
+    println!("====================================================");
+    println!("Tekan ENTER langsung untuk mempertahankan nilai [default].");
+    println!();
+
+    let mut cfg = config::load().unwrap_or_default();
+
+    // ── 1. Auth ───────────────────────────────────────────
+    println!("🔑 [1/5] Akun TIX.ID");
+    cfg.auth.msisdn = prompt("Nomor HP (+628...)", &cfg.auth.msisdn);
+    cfg.auth.password = prompt("Password token (RSA encrypted dari DevTools)", &cfg.auth.password);
+    println!();
+
+    // ── 2. Target ─────────────────────────────────────────
+    println!("🎯 [2/5] Target Film & Mode");
+    prompt_target_mode(&mut cfg);
     println!();
 
     // ── 3. Kursi ──────────────────────────────────────────
@@ -132,18 +229,8 @@ pub fn run_setup() -> anyhow::Result<Config> {
         cfg.notification.discord_webhook_url = prompt("Discord Webhook URL", &cfg.notification.discord_webhook_url);
         println!("   💡 Tip Mention: Discord Webhook butuh ID Pengguna (bukan @username biasa).");
         println!("      Gunakan: <@USER_ID>, angka ID, @everyone, atau @here.");
-        println!("      (Cara dapatkan ID: Aktifkan Discord Developer Mode > Klik kanan profil Anda > Salin ID Pengguna)");
         cfg.notification.discord_mention = prompt("Discord Mention (opsional)", &cfg.notification.discord_mention);
     }
-    println!();
 
-    // Simpan ke config.toml
-    config::save(&cfg)?;
-
-    println!("====================================================");
-    println!("✅ Pengaturan berhasil disimpan ke: {}", config::get_config_path().display());
-    println!("====================================================");
-    println!();
-
-    Ok(cfg)
+    print_summary_and_confirm(&cfg)
 }

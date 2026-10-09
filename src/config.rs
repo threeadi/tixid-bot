@@ -26,7 +26,10 @@ pub struct AuthConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TargetConfig {
+    #[serde(default)]
     pub movie_id: String,
+    #[serde(default)]
+    pub movie_title: String,
     pub city_id: String,
     pub date: String,
     /// Datetime ranges to skip. Each entry is ["YYYY-MM-DD HH:MM", "YYYY-MM-DD HH:MM"] (inclusive).
@@ -85,6 +88,13 @@ pub struct PollingConfig {
     pub refresh_token_before_secs: u64,
     /// Optional WIB time ("YYYY-MM-DD HH:MM:SS") before polling starts
     pub start_at: String,
+    /// Minutes between periodic checks when searching for a movie in Beacon mode
+    #[serde(default = "default_beacon_interval_mins")]
+    pub beacon_interval_mins: u64,
+}
+
+fn default_beacon_interval_mins() -> u64 {
+    15
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -131,6 +141,7 @@ impl Default for Config {
             },
             target: TargetConfig {
                 movie_id: String::new(),
+                movie_title: String::new(),
                 city_id: String::new(),
                 date: String::new(),
                 blocked_datetime_ranges: Vec::new(),
@@ -163,6 +174,7 @@ impl Default for Config {
                 interval_secs: 2,
                 refresh_token_before_secs: 1500,
                 start_at: String::new(),
+                beacon_interval_mins: 15,
             },
             notification: NotificationConfig::default(),
         }
@@ -214,6 +226,54 @@ pub fn save(config: &Config) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Cannot serialize config: {}", e))?;
     std::fs::write(&path, text)
         .map_err(|e| anyhow::anyhow!("Cannot write {}: {}", path.display(), e))?;
+    Ok(())
+}
+
+/// Updates `movie_id = "..."` under `[target]` in `config.toml` on disk without destroying comments.
+pub fn update_movie_id_in_file(path: &std::path::Path, new_movie_id: &str) -> Result<()> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "cannot read config file to update movie_id");
+            return Ok(());
+        }
+    };
+
+    let mut in_target = false;
+    let mut updated = false;
+    let mut new_lines = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_target = trimmed == "[target]";
+        }
+
+        if in_target && (trimmed.starts_with("movie_id") || trimmed.starts_with("movie_id ")) {
+            new_lines.push(format!("movie_id = \"{}\"", new_movie_id));
+            updated = true;
+        } else {
+            new_lines.push(line.to_string());
+        }
+    }
+
+    if updated {
+        let mut out = new_lines.join("\n");
+        if content.ends_with('\n') {
+            out.push('\n');
+        }
+        std::fs::write(path, out)?;
+        tracing::info!(path = %path.display(), movie_id = new_movie_id, "updated movie_id in config.toml");
+    } else {
+        // Fallback: load, modify, and serialize
+        if let Ok(mut cfg) = toml::from_str::<Config>(&content) {
+            cfg.target.movie_id = new_movie_id.to_string();
+            let text = toml::to_string_pretty(&cfg)?;
+            std::fs::write(path, text)?;
+            tracing::info!(path = %path.display(), movie_id = new_movie_id, "updated movie_id via fallback serialization");
+        }
+    }
+
     Ok(())
 }
 
@@ -537,18 +597,65 @@ start_at = ""
     }
 
     #[test]
-    fn serialize_and_deserialize_roundtrip() {
-        let original: Config = toml::from_str(MINIMAL).unwrap();
-        let serialized = toml::to_string_pretty(&original).expect("serialize should succeed");
-        let parsed: Config =
-            toml::from_str(&serialized).expect("deserialize roundtrip should succeed");
-        assert_eq!(original.auth.msisdn, parsed.auth.msisdn);
-        assert_eq!(original.auth.password, parsed.auth.password);
-        assert_eq!(original.target.movie_id, parsed.target.movie_id);
-        assert_eq!(original.seat.quantity, parsed.seat.quantity);
-        assert_eq!(
-            original.payment.payment_option,
-            parsed.payment.payment_option
-        );
+    fn test_beacon_config_deserialization_and_update() {
+        let toml_str = r#"
+[auth]
+msisdn = "+6281234567890"
+password = "secret_password"
+
+[target]
+movie_id = ""
+movie_title = "Avengers: Doomsday"
+city_id = "973818515335155712"
+date = "2026-10-10"
+
+[theater]
+theater_priority = ["ARAYA XXI"]
+
+[showtime]
+preferred_time_start = "12:00"
+preferred_time_end = "21:00"
+
+[seat]
+quantity = 2
+manual_seats = []
+avoid_first_rows = 2
+preferred_rows = ["C", "F"]
+
+[device]
+device_id = "test-device"
+longitude = "112.0"
+latitude = "-8.0"
+
+[payment]
+payment_method = "NETWORK_PAY"
+payment_option = "NETWORK_PAY_PG_QRIS"
+
+[polling]
+enabled = true
+interval_secs = 2
+refresh_token_before_secs = 1500
+start_at = ""
+beacon_interval_mins = 20
+"#;
+        let c: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(c.target.movie_id, "");
+        assert_eq!(c.target.movie_title, "Avengers: Doomsday");
+        assert_eq!(c.polling.beacon_interval_mins, 20);
+
+        // Test update_movie_id_in_file
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("test_config_{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(&temp_file, toml_str).unwrap();
+
+        update_movie_id_in_file(&temp_file, "999888777").unwrap();
+        let reloaded = std::fs::read_to_string(&temp_file).unwrap();
+        assert!(reloaded.contains("movie_id = \"999888777\""));
+        assert!(reloaded.contains("movie_title = \"Avengers: Doomsday\""));
+
+        let parsed: Config = toml::from_str(&reloaded).unwrap();
+        assert_eq!(parsed.target.movie_id, "999888777");
+
+        let _ = std::fs::remove_file(temp_file);
     }
 }

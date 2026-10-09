@@ -1,7 +1,9 @@
 mod api;
+mod beacon;
 mod bot;
 mod client;
 mod config;
+mod fuzzy;
 mod logger;
 mod models;
 mod notifier;
@@ -11,6 +13,21 @@ mod wizard;
 
 use std::io::{self, Write};
 
+async fn run_bot_safe() -> anyhow::Result<()> {
+    tokio::select! {
+        res = bot::run() => {
+            if let Err(e) = res {
+                tracing::error!(error = %e, "bot terminated with error");
+                return Err(e);
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            println!("\n🛑 Bot dihentikan (Ctrl + C). Sampai jumpa! 👋");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Guard must live until end of main so the background writer flushes on exit.
@@ -19,26 +36,14 @@ async fn main() -> anyhow::Result<()> {
     // Check CLI flags
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--setup" || a == "-s") {
-        wizard::run_setup()?;
-        print!("\nApakah ingin langsung menjalankan bot? [Y/n]: ");
-        let _ = io::stdout().flush();
-        let mut ans = String::new();
-        let _ = io::stdin().read_line(&mut ans);
-        if ans.trim().eq_ignore_ascii_case("n") {
-            return Ok(());
-        }
-        if let Err(e) = bot::run().await {
-            tracing::error!(error = %e, "bot terminated with error");
-            return Err(e);
+        if wizard::run_setup()? {
+            run_bot_safe().await?;
         }
         return Ok(());
     }
 
     if args.iter().any(|a| a == "--no-interactive" || a == "-y") {
-        if let Err(e) = bot::run().await {
-            tracing::error!(error = %e, "bot terminated with error");
-            return Err(e);
-        }
+        run_bot_safe().await?;
         return Ok(());
     }
 
@@ -47,50 +52,60 @@ async fn main() -> anyhow::Result<()> {
         println!();
         println!("⚠️  File config.toml belum ditemukan.");
         println!("Memulai Setup Wizard untuk konfigurasi pertama kali...");
-        wizard::run_setup()?;
+        if wizard::run_setup()? {
+            return run_bot_safe().await;
+        }
     }
 
     // Interactive Menu Loop
     loop {
+        let cfg = config::load().unwrap_or_default();
+
         println!();
-        println!("🎬 TIX.ID Bot");
-        println!("========================================");
-        println!("  [1] Mulai Bot (War Tiket)");
-        println!("  [2] Ubah Pengaturan (Setup Wizard)");
-        println!("  [3] Keluar");
-        println!("========================================");
-        print!("Pilih menu [1-3] (default: 1): ");
+        println!("🎬 TIX.ID Bot [v1.0.0-beta]");
+        println!("--------------------------------------------------");
+        wizard::print_config_status(&cfg);
+        println!("--------------------------------------------------");
+        println!("  [1] Mulai Bot");
+        println!("  [2] Quick Setup Target (Ganti Film / Mode)");
+        println!("  [3] Full Setup Wizard (Konfigurasi Lengkap)");
+        println!("  [4] Keluar");
+        println!("--------------------------------------------------");
+        print!("Pilih menu [1-4] (default: 1): ");
         let _ = io::stdout().flush();
 
         let mut choice = String::new();
         let bytes = io::stdin().read_line(&mut choice)?;
         if bytes == 0 {
             // EOF (e.g. piped stdin), default to running bot
-            if let Err(e) = bot::run().await {
-                tracing::error!(error = %e, "bot terminated with error");
-                return Err(e);
-            }
+            run_bot_safe().await?;
             break;
         }
 
         let choice = choice.trim();
         match choice {
             "1" | "" => {
-                if let Err(e) = bot::run().await {
-                    tracing::error!(error = %e, "bot terminated with error");
-                    return Err(e);
-                }
+                run_bot_safe().await?;
                 break;
             }
             "2" => {
-                let _ = wizard::run_setup();
+                if wizard::run_quick_setup()? {
+                    run_bot_safe().await?;
+                    break;
+                }
             }
             "3" => {
+                if wizard::run_setup()? {
+                    run_bot_safe().await?;
+                    break;
+                }
+            }
+            "4" => {
                 println!("Sampai jumpa! 👋");
                 return Ok(());
             }
             _ => {
-                println!("Pilihan tidak valid, silakan ketik 1, 2, atau 3.");
+                println!("Pilihan tidak valid, silakan ketik 1, 2, 3, atau 4.");
             }
         }
     }

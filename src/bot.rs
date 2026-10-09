@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -8,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
-use crate::{api, client, config, notifier, seat_selector, theater_selector};
+use crate::{api, beacon, client, config, notifier, seat_selector, theater_selector};
 
 struct AuthSession {
     http: Client,
@@ -29,16 +30,27 @@ pub async fn run() -> Result<()> {
     // Login SEBELUM standby agar token dan koneksi TCP/TLS sudah siap saat war!
     let mut auth = authenticate(&cfg).await?;
 
-    // ── 3. Pre-fetch & Cache Movie Metadata (Strategi B) ────────────────────
+    // ── 3. Resolve Target Movie (Beacon Mode vs Direct Movie ID) ────────────
     let clean_id = clean_movie_id(&cfg.target.movie_id);
-    print!("🎥 Pre-fetching movie {}...", clean_id);
-    let mut movie = api::get_movie(&auth.http, &clean_id).await?;
-    if movie.id.trim().is_empty() {
-        return Err(anyhow::anyhow!(
-            "Film tidak ditemukan di TIX ID (ID '{}' tidak menghasilkan data). Pastikan movie_id berupa ID film yang benar (contoh: 2093187333460410368).",
-            cfg.target.movie_id
-        ));
-    }
+    let mut movie = if clean_id.is_empty() {
+        if cfg.target.movie_title.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "movie_id dan movie_title kosong! Harap isi target.movie_id atau target.movie_title di config.toml."
+            ));
+        }
+        run_beacon_mode(&mut cfg, &mut auth).await?
+    } else {
+        print!("🎥 Pre-fetching movie {}...", clean_id);
+        let m = api::get_movie(&auth.http, &clean_id).await?;
+        if m.id.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Film tidak ditemukan di TIX ID (ID '{}' tidak menghasilkan data). Pastikan movie_id berupa ID film yang benar (contoh: 2093187333460410368).",
+                cfg.target.movie_id
+            ));
+        }
+        m
+    };
+
     println!(
         "\r✅ {} ({} min, {})               ",
         movie.name, movie.duration, movie.status
@@ -361,6 +373,141 @@ async fn wait_until_start_with_keepalive(
     Ok(())
 }
 
+/// Beacon Mode: Periodically discovers movie by title from TIX.ID catalog,
+/// resolves `movie_id`, updates `config.toml`, alerts the user, and monitors
+/// for showtime/presale availability.
+async fn run_beacon_mode(
+    cfg: &mut config::Config,
+    auth: &mut AuthSession,
+) -> Result<crate::models::MovieData> {
+    let query_title = cfg.target.movie_title.trim().to_string();
+    println!("📡 Mode Beaconing / Reckoning Aktif");
+    println!("   Target Judul : \"{}\"", query_title);
+    println!("   Interval Cek : {} menit", cfg.polling.beacon_interval_mins);
+    println!("========================================");
+    tracing::info!(query = %query_title, interval_mins = cfg.polling.beacon_interval_mins, "starting beacon discovery mode");
+
+    let mut last_modified = None;
+    let beacon_step_secs = (cfg.polling.beacon_interval_mins * 60).max(10);
+
+    loop {
+        config::check_and_reload(&mut last_modified, cfg);
+
+        // If user manually set movie_id in config.toml during live reload
+        let clean_id = clean_movie_id(&cfg.target.movie_id);
+        if !clean_id.is_empty() {
+            println!("\r✅ Live reload: movie_id terisi manual ({})", clean_id);
+            let movie = api::get_movie(&auth.http, &clean_id).await?;
+            if !movie.id.trim().is_empty() {
+                return Ok(movie);
+            }
+        }
+
+        refresh_auth_if_needed(cfg, auth).await?;
+
+        print!("📡 [BEACON] Mencari \"{}\" di katalog TIX.ID...", query_title);
+        let _ = std::io::stdout().flush();
+
+        match beacon::fetch_catalog(&auth.http).await {
+            Ok(candidates) => {
+                if let Some((best, score)) = beacon::find_best_match(&candidates, &query_title, beacon::DEFAULT_MATCH_THRESHOLD) {
+                    println!(
+                        "\r✅ [BEACON] Film Ditemukan: \"{}\" (ID: {}, Kemiripan: {:.0}%)",
+                        best.display_name, best.id, score * 100.0
+                    );
+                    tracing::info!(
+                        matched = %best.display_name,
+                        movie_id = %best.id,
+                        similarity = score,
+                        "beacon movie match found"
+                    );
+
+                    // Fetch complete metadata from TIX ID
+                    let movie = api::get_movie(&auth.http, &best.id).await?;
+                    if !movie.id.trim().is_empty() {
+                        // Persist movie_id back into config.toml
+                        cfg.target.movie_id = best.id.clone();
+                        let cfg_path = config::get_config_path();
+                        let _ = config::update_movie_id_in_file(&cfg_path, &best.id);
+
+                        // Check whether schedules are already open
+                        let dates = api::get_schedule_dates(&auth.http, &movie.id, &cfg.target.city_id).await.ok().flatten();
+                        let has_active_schedule = dates.as_ref().map(|d| d.iter().any(|s| s.is_any_schedule)).unwrap_or(false);
+
+                        if has_active_schedule {
+                            notifier::notify_beacon_found(
+                                &cfg.notification,
+                                &query_title,
+                                &movie.name,
+                                &movie.id,
+                                score,
+                                &movie.status,
+                                "Jadwal tayang aktif! Melanjutkan ke proses War Checkout..."
+                            ).await;
+                            return Ok(movie);
+                        } else {
+                            // Status UPCOMING or no schedules yet
+                            notifier::notify_beacon_found(
+                                &cfg.notification,
+                                &query_title,
+                                &movie.name,
+                                &movie.id,
+                                score,
+                                &movie.status,
+                                &format!("Jadwal belum buka. Memantau pembukaan tiket setiap {} menit...", cfg.polling.beacon_interval_mins)
+                            ).await;
+
+                            println!(
+                                "⏳ [BEACON] Menunggu jadwal tayang/presale dibuka (cek setiap {} menit)...",
+                                cfg.polling.beacon_interval_mins
+                            );
+
+                            // Schedule monitoring loop
+                            loop {
+                                config::check_and_reload(&mut last_modified, cfg);
+                                refresh_auth_if_needed(cfg, auth).await?;
+
+                                if let Ok(Some(dates)) = api::get_schedule_dates(&auth.http, &movie.id, &cfg.target.city_id).await {
+                                    if let Some(target_d) = pick_target_date(cfg, &dates) {
+                                        println!("\n⚡ [BEACON] Jadwal Presale Terbuka untuk {} ({})!", movie.name, target_d);
+                                        notifier::notify_beacon_presale_opened(
+                                            &cfg.notification,
+                                            &movie.name,
+                                            &movie.id,
+                                            &target_d,
+                                        ).await;
+                                        return Ok(movie);
+                                    }
+                                }
+
+                                // Sleep before next schedule probe with keepalive
+                                let steps = beacon_step_secs / 5;
+                                for _ in 0..steps {
+                                    sleep(Duration::from_secs(5)).await;
+                                    config::check_and_reload(&mut last_modified, cfg);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    println!("\r⏳ [BEACON] Belum terdaftar di katalog. Coba lagi dalam {} menit...", cfg.polling.beacon_interval_mins);
+                }
+            }
+            Err(e) => {
+                println!("\r⚠️  [BEACON] Gagal mengambil katalog: {}. Coba lagi dalam {} menit...", e, cfg.polling.beacon_interval_mins);
+                tracing::warn!(error = %e, "beacon catalog fetch failed");
+            }
+        }
+
+        // Sleep before retrying catalog check with keepalive
+        let steps = beacon_step_secs / 5;
+        for _ in 0..steps {
+            sleep(Duration::from_secs(5)).await;
+            config::check_and_reload(&mut last_modified, cfg);
+        }
+    }
+}
+
 /// Fire ALL seat layout requests in parallel, then resolve to the highest-ranked
 /// theater that has N consecutive seats.
 ///
@@ -506,13 +653,13 @@ async fn wait_for_target_showtime(
 
         refresh_auth_if_needed(cfg, auth).await?;
 
-        // Jika film masih upcoming, tunggu polling
+        // Jika film masih upcoming, tunggu polling santai sesuai beacon_interval_mins
         if movie.status.eq_ignore_ascii_case("UPCOMING") {
             let release = movie
                 .release_date
                 .map(format_unix_wib)
                 .unwrap_or_else(|| "unknown".to_string());
-            wait_or_fail(
+            wait_upcoming_or_fail(
                 cfg,
                 &format!(
                     "Film masih UPCOMING (presale_flag={:?}, release={}).",
@@ -654,6 +801,29 @@ async fn wait_or_fail(cfg: &config::Config, reason: &str) -> Result<()> {
     Ok(())
 }
 
+async fn wait_upcoming_or_fail(cfg: &config::Config, reason: &str) -> Result<()> {
+    if !cfg.polling.enabled {
+        return Err(anyhow::anyhow!(reason.to_string()));
+    }
+
+    let interval_secs = (cfg.polling.beacon_interval_mins * 60).max(cfg.polling.interval_secs);
+    println!(
+        "⏱️  {} Cek jadwal ulang dalam {} menit...",
+        reason, cfg.polling.beacon_interval_mins
+    );
+    tracing::warn!(reason = %reason, retry_in_secs = interval_secs, "upcoming polling retry");
+
+    let steps = interval_secs / 5;
+    let rem = interval_secs % 5;
+    for _ in 0..steps {
+        sleep(Duration::from_secs(5)).await;
+    }
+    if rem > 0 {
+        sleep(Duration::from_secs(rem)).await;
+    }
+    Ok(())
+}
+
 fn wib() -> FixedOffset {
     FixedOffset::east_opt(7 * 3600).expect("valid WIB offset")
 }
@@ -711,6 +881,7 @@ mod tests {
             auth: AuthConfig { msisdn: "08123".into(), password: "pw".into() },
             target: TargetConfig {
                 movie_id: "m1".into(),
+                movie_title: "".into(),
                 city_id: "c1".into(),
                 date: date.into(),
                 blocked_datetime_ranges: blocked,
@@ -720,7 +891,7 @@ mod tests {
             seat: SeatConfig { quantity: 2, manual_seats: vec![], avoid_first_rows: 0, preferred_rows: vec![] },
             device: DeviceConfig { device_id: "dev".into(), longitude: "0".into(), latitude: "0".into() },
             payment: PaymentConfig { payment_method: "M".into(), payment_option: "O".into() },
-            polling: PollingConfig { enabled: false, interval_secs: 5, refresh_token_before_secs: 300, start_at: "".into() },
+            polling: PollingConfig { enabled: false, interval_secs: 5, refresh_token_before_secs: 300, start_at: "".into(), beacon_interval_mins: 15 },
             notification: Default::default(),
         }
     }

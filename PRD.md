@@ -32,9 +32,10 @@ msisdn   = "+628xxxxxxxxxx"
 password = "<RSA-encrypted-password>"   # salin dari browser DevTools
 
 [target]
-movie_id = "2039608798242488320"        # ID dari URL tix.id
-city_id  = "973818515335155712"         # Malang
-date     = ""                           # kosong = auto (tanggal pertama tersedia)
+movie_id    = ""                        # ID dari URL tix.id (kosongkan jika pakai Beacon mode)
+movie_title = "Avengers: Doomsday"      # Dicari otomatis jika movie_id kosong (Fuzzy match)
+city_id     = "973818515335155712"      # Malang
+date        = ""                        # kosong = auto (tanggal pertama tersedia)
 blocked_datetime_ranges = []            # range tanggal/jam yang ingin diskip
 
 [theater]
@@ -70,6 +71,7 @@ enabled                  = true
 interval_secs            = 2
 refresh_token_before_secs = 1500
 start_at                 = ""           # format "YYYY-MM-DD HH:MM:SS" WIB
+beacon_interval_mins     = 15           # jeda cek berkala (menit) saat mencari film di katalog
 
 [notification]
 desktop_enabled     = true              # notifikasi pop-up Windows Toast
@@ -80,8 +82,9 @@ discord_mention     = ""                # "@everyone", "<@USER_ID>", atau "<@&RO
 ```
 
 ### Fitur Konfigurasi & Portabilitas
+* **Beaconing / Reckoning Mode**: Jika `movie_id` dibiarkan kosong `""`, bot secara otomatis memantau katalog publik TIX.ID setiap `beacon_interval_mins` untuk mencari judul `movie_title` menggunakan Best Fuzzy Match. Begitu film terdaftar, ID-nya disimpan otomatis ke `config.toml` dan bot memantau jadwal tayang/presale.
 * **Portable Path Resolution**: File `config.toml` dicari secara dinamis di direktori yang sama dengan tempat file binary `.exe` berada, aman dibuka via double-click di File Explorer maupun shortcut Desktop.
-* **Interactive Setup Wizard**: Menu interaktif di terminal untuk mengatur konfigurasi dengan nilai default (cukup tekan `Enter` untuk mempertahankan nilai lama).
+* **Interactive Setup Wizard & Quick Setup**: Menu interaktif di terminal dengan tampilan status konfigurasi aktif, pemisahan antara `[2] Quick Setup Target (Ganti Film / Mode: War vs Beacon)` dan `[3] Full Setup Wizard (Konfigurasi Lengkap)`, serta konfirmasi ringkasan untuk langsung mulai bot.
 * **Live Hot-Reload**: Saat bot dalam mode standby/polling, perubahan pada `config.toml` (di-edit & di-save via Notepad) otomatis dimuat ulang seketika tanpa perlu me-restart bot. Jika ada kesalahan sintaks, bot mempertahankan konfigurasi sebelumnya tanpa crash.
 
 ---
@@ -89,15 +92,22 @@ discord_mention     = ""                # "@everyone", "<@USER_ID>", atau "<@&RO
 ## 4. Alur Bot
 
 ```
-1. Startup: Tampilkan menu interaktif ([1] Mulai Bot, [2] Setup Wizard, [3] Keluar).
+1. Startup: Tampilkan menu interaktif:
+   [1] Mulai Bot
+   [2] Quick Setup Target (Ganti Film / Mode: War vs Beacon)
+   [3] Full Setup Wizard (Konfigurasi Lengkap)
+   [4] Keluar
    (Jika config.toml belum ada, otomatis masuk ke Setup Wizard terlebih dahulu).
 2. Load config.toml (dengan fallback & portable path resolution).
-3. (Opsional) Standby sampai polling.start_at (war timer).
-4. POST /v1/auth → guest token (anonymous, client_id="tixid_guest").
-5. LOGIN (pakai guest token) → user JWT + refresh_token.
-6. GET movie by movie_id → dapat schedule_id (data.id); poll jika UPCOMING.
-   (Live Hot-Reload aktif selama loop polling jika config.toml diedit).
-7. GET schedule dates → pilih date (config / otomatis = tanggal pertama tersedia).
+3. POST /v1/auth → guest token (anonymous, client_id="tixid_guest").
+4. LOGIN (pakai guest token) → user JWT + refresh_token.
+5. Resolusi Target Film:
+   - Jika movie_id kosong: Masuk ke Mode Beaconing (Scrape katalog TIX.ID berkala setiap beacon_interval_mins,
+     cocokkan judul film dengan Best Fuzzy Match, simpan movie_id ke config.toml, kirim notifikasi Discord/Desktop).
+   - Jika movie_id ada: Langsung fetch movie metadata.
+6. (Opsional) Standby sampai polling.start_at jika diisi (Pre-authenticated keepalive).
+7. GET schedule dates → jika film UPCOMING tanpa jadwal, pantau setiap beacon_interval_mins;
+   begitu jadwal buka, percepat ke polling 2 detik.
 8. GET theaters + showtimes (page=1) → ranking semua bioskop sesuai theater_priority.
 9. Parallel Seat Layout Race:
    a. Kirim request seat layout ke semua bioskop secara paralel serentak.

@@ -5,8 +5,12 @@ msisdn = "+6289xxxx"
 password = "HE4n7ViZkM9iNn/dQnvgaaLvSeg2pH81V5L1p/eBzYnvOl4TQ=="
 
 [target]
-# ID movie dari URL tix.id (GET /v1/movies/{movie_id})
-movie_id = "2039608798242488320"
+# ID movie dari URL tix.id (GET /v1/movies/{movie_id}).
+# Jika dikosongkan (""), bot akan mengaktifkan MODE BEACONING / RECKONING untuk mencari film berdasarkan movie_title.
+movie_id = ""
+# Judul film untuk dicari secara otomatis di katalog TIX.ID jika movie_id kosong.
+# Contoh: "Avengers: Doomsday", "Hasut", "Resident Evil" (fuzzy keyword, case-insensitive).
+movie_title = "Avengers: Doomsday"
 # Kota Malang
 city_id = "973818515335155712"
 # Tanggal nonton (format YYYY-MM-DD). Kosongkan ("") untuk otomatis pakai tanggal pertama tersedia.
@@ -68,6 +72,9 @@ interval_secs = 2
 refresh_token_before_secs = 1500
 # WIB, format: "YYYY-MM-DD HH:MM:SS". Kosongkan "" untuk mulai sekarang.
 start_at = ""
+# Interval berkala dalam satuan MENIT saat mencari film di katalog pada mode Beaconing / Reckoning.
+# Default 15 menit agar aman dan tidak membebani server TIX.ID.
+beacon_interval_mins = 15
 
 [notification]
 # Tampilkan pop-up notifikasi desktop OS (Windows Toast)
