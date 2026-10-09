@@ -25,8 +25,6 @@ static CPU_TRACKER: Mutex<Option<CpuState>> = Mutex::new(None);
 
 #[cfg(windows)]
 mod os {
-    use super::*;
-
     #[repr(C)]
     struct ProcessMemoryCounters {
         cb: u32,

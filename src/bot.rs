@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -89,61 +90,16 @@ pub async fn run() -> Result<()> {
     let (target_date, ranked, strike_start) =
         wait_for_target_showtime(&mut cfg, &mut auth, &mut movie).await?;
 
-    // ── 6 & 7. Find theater with N consecutive seats (parallel) ──────────────
-    let (selected, layout, seats) =
-        try_theaters_for_seats(&auth.http, &cfg, &ranked).await?;
-
-    let available_count: usize = layout
-        .seat_map
-        .iter()
-        .flat_map(|sm| sm.seat_rows.iter())
-        .filter(|sr| sr.status == 1)
-        .count();
-    let total_count: usize = layout
-        .seat_map
-        .iter()
-        .flat_map(|sm| sm.seat_rows.iter())
-        .count();
-
-    println!();
-    println!("🎬 Selected showtime:");
-    println!("   Movie:     {}", movie.name);
-    println!("   Theater:  {}", selected.theater.name);
-    println!("   Time:     {}", selected.showtime.display_time);
-    println!("   Studio:   {}", selected.showtime.studio);
-    println!("   Date:     {}", target_date);
-    println!("   Category: {}", selected.category);
-    println!("   Price:    Rp{}", fmt_rupiah(selected.showtime.price));
-    println!(
-        "✅ Available: {}/{} seats (tx limit: {})          ",
-        available_count, total_count, layout.user_seat_transaction_limit
-    );
-    tracing::info!(
-        movie = %movie.name,
-        theater = %selected.theater.name,
-        time = %selected.showtime.display_time,
-        studio = %selected.showtime.studio,
-        date = %target_date,
-        category = %selected.category,
-        price = selected.showtime.price,
-        showtime_id = %selected.showtime.id,
-        "showtime selected"
-    );
-
-    println!("💺 Selected seats: {}", seats.iter().map(|s| s.display.as_str()).collect::<Vec<_>>().join(", "));
-    tracing::info!(seats = %seats.iter().map(|s| s.display.as_str()).collect::<Vec<_>>().join(", "), theater = %selected.theater.name, "seats selected");
-
-    // ── 8. Create order (Lock seats) ─────────────────────────────────────────
-    println!("\n🛒 Placing order (Locking seats)...");
-    let order = api::create_order(
+    // ── 6, 7 & 8. Find theater & lock seats (with Auto Seat Re-Roll on Conflict) ──
+    let (_selected, order, _seats, seat_lock_elapsed) = lock_order_with_reroll(
         &auth.http,
-        &selected.theater.merchant.merchant_id,
-        &selected.showtime.id,
-        &seats,
+        &cfg,
+        &ranked,
+        &target_date,
+        &movie,
+        strike_start,
     )
     .await?;
-
-    let seat_lock_elapsed = strike_start.elapsed();
 
     // Format expiry time in WIB (UTC+7)
     let wib = FixedOffset::east_opt(7 * 3600).unwrap();
@@ -658,6 +614,188 @@ async fn try_theaters_for_seats(
     ))
 }
 
+/// Mengunci kursi dan membuat order dengan fitur Auto Seat Re-Roll on Conflict.
+///
+/// Jika `api::create_order` gagal (misalnya karena kursi bentrok / diambil orang lain milidetik sebelumnya),
+/// kursi yang bermasalah akan di-blacklist secara otomatis dan bot langsung mencoba kursi alternatif
+/// terbaik berikutnya di studio yang sama (tanpa jeda).
+/// Jika semua kursi di bioskop/studio tersebut habis (atau mencapai `max_rerolls`),
+/// bot akan otomatis fallback ke bioskop peringkat berikutnya dalam `ranked`.
+async fn lock_order_with_reroll(
+    http: &Client,
+    cfg: &config::Config,
+    ranked: &[theater_selector::SelectedShowtime],
+    target_date: &str,
+    movie: &crate::models::MovieData,
+    strike_start: Instant,
+) -> Result<(
+    theater_selector::SelectedShowtime,
+    crate::models::OrderData,
+    Vec<crate::models::SelectedSeat>,
+    Duration,
+)> {
+    if ranked.is_empty() {
+        return Err(anyhow::anyhow!("Daftar bioskop ranked kosong"));
+    }
+
+    let mut current_ranked_slice = ranked;
+
+    // 1. Dapatkan kandidat bioskop terbaik pertama yang memiliki kursi
+    let (mut current_selected, mut current_layout, mut current_seats) =
+        try_theaters_for_seats(http, cfg, current_ranked_slice).await?;
+
+    let max_rerolls = cfg.seat.max_rerolls;
+    let mut excluded_seats: HashSet<String> = HashSet::new();
+    let mut current_rerolls: usize = 0;
+
+    loop {
+        let available_count: usize = current_layout
+            .seat_map
+            .iter()
+            .flat_map(|sm| sm.seat_rows.iter())
+            .filter(|sr| sr.status == 1 && !excluded_seats.contains(&sr.seat_row))
+            .count();
+        let total_count: usize = current_layout
+            .seat_map
+            .iter()
+            .flat_map(|sm| sm.seat_rows.iter())
+            .count();
+
+        println!();
+        println!("🎬 Selected showtime:");
+        println!("   Movie:     {}", movie.name);
+        println!("   Theater:   {}", current_selected.theater.name);
+        println!("   Time:      {}", current_selected.showtime.display_time);
+        println!("   Studio:    {}", current_selected.showtime.studio);
+        println!("   Date:      {}", target_date);
+        println!("   Category:  {}", current_selected.category);
+        println!("   Price:     Rp{}", fmt_rupiah(current_selected.showtime.price));
+        println!(
+            "✅ Available: {}/{} seats (tx limit: {})          ",
+            available_count, total_count, current_layout.user_seat_transaction_limit
+        );
+        let seat_displays = current_seats
+            .iter()
+            .map(|s| s.display.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("💺 Selected seats: {}", seat_displays);
+
+        tracing::info!(
+            movie = %movie.name,
+            theater = %current_selected.theater.name,
+            time = %current_selected.showtime.display_time,
+            studio = %current_selected.showtime.studio,
+            date = %target_date,
+            seats = %seat_displays,
+            reroll_attempt = current_rerolls,
+            "attempting create_order (locking seats)"
+        );
+
+        println!("\n🛒 Placing order (Locking seats: {})...", seat_displays);
+
+        match api::create_order(
+            http,
+            &current_selected.theater.merchant.merchant_id,
+            &current_selected.showtime.id,
+            &current_seats,
+        )
+        .await
+        {
+            Ok(order) => {
+                let seat_lock_elapsed = strike_start.elapsed();
+                return Ok((current_selected, order, current_seats, seat_lock_elapsed));
+            }
+            Err(e) => {
+                let failed_seat_str = seat_displays.clone();
+                tracing::warn!(
+                    theater = %current_selected.theater.name,
+                    seats = %failed_seat_str,
+                    error = %e,
+                    attempt = current_rerolls + 1,
+                    max_rerolls = max_rerolls,
+                    "kursi bentrok / gagal create_order"
+                );
+                println!(
+                    "⚠️  Kursi [{}] bentrok / gagal dilock: {}",
+                    failed_seat_str, e
+                );
+
+                // Blacklist kursi yang bentrok
+                for s in &current_seats {
+                    excluded_seats.insert(s.display.clone());
+                    excluded_seats.insert(s.seat_id.clone());
+                }
+
+                current_rerolls += 1;
+
+                // Coba auto re-roll kursi berikutnya di layout bioskop yang sama
+                let next_seats = if current_rerolls < max_rerolls {
+                    seat_selector::select_with_exclusions(
+                        &current_layout.seat_map,
+                        &cfg.seat,
+                        &excluded_seats,
+                    )
+                } else {
+                    None
+                };
+
+                if let Some(next) = next_seats {
+                    let next_display = next
+                        .iter()
+                        .map(|s| s.display.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!(
+                        "🔄 [Auto Seat Re-Roll #{}/{}] Memilih alternatif di {}: {}",
+                        current_rerolls,
+                        max_rerolls,
+                        current_selected.theater.name,
+                        next_display
+                    );
+                    current_seats = next;
+                    continue;
+                }
+
+                // Jika kursi di studio ini habis atau batas re-roll tercapai, fallback ke bioskop berikutnya
+                println!(
+                    "⏭️  Studio {} tidak lagi memiliki {} kursi berurutan (atau max reroll {} tercapai).",
+                    current_selected.theater.name,
+                    cfg.seat.quantity,
+                    max_rerolls
+                );
+
+                let current_idx = current_ranked_slice
+                    .iter()
+                    .position(|r| r.showtime.id == current_selected.showtime.id)
+                    .unwrap_or(0);
+                let remaining = &current_ranked_slice[(current_idx + 1)..];
+
+                if remaining.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "Semua bioskop yang cocok telah dicoba dan gagal dilock (kursi bentrok / habis)."
+                    ));
+                }
+
+                println!(
+                    "\n🔀 Fallback ke {} bioskop prioritas berikutnya...",
+                    remaining.len()
+                );
+
+                current_ranked_slice = remaining;
+                let (next_selected, next_layout, next_seats) =
+                    try_theaters_for_seats(http, cfg, current_ranked_slice).await?;
+
+                current_selected = next_selected;
+                current_layout = next_layout;
+                current_seats = next_seats;
+                excluded_seats.clear();
+                current_rerolls = 0;
+            }
+        }
+    }
+}
+
 async fn wait_for_target_showtime(
     cfg: &mut config::Config,
     auth: &mut AuthSession,
@@ -707,12 +845,12 @@ async fn wait_for_target_showtime(
             continue;
         }
 
-        // Tentukan target_date:
-        // Strategi B: Jika target.date sudah diisi di config.toml, langsung gunakan (tanpa hit get_schedule_dates)!
-        let target_date = if !cfg.target.date.trim().is_empty() {
-            cfg.target.date.trim().to_string()
+        // Tentukan daftar target_date berdasarkan prioritas (Multi-Date Priority):
+        // Strategi B: Jika preferred_dates kosong dan target.date terisi, langsung gunakan (tanpa hit get_schedule_dates)!
+        let target_dates: Vec<String> = if cfg.target.preferred_dates.is_empty() && !cfg.target.date.trim().is_empty() {
+            vec![cfg.target.date.trim().to_string()]
         } else {
-            // Jika tanggal kosong di config, ambil daftar tanggal aktif
+            // Ambil daftar tanggal aktif dari API
             let dates = match api::get_schedule_dates(&auth.http, &movie.id, &cfg.target.city_id).await? {
                 Some(dates) => dates,
                 None => {
@@ -720,46 +858,59 @@ async fn wait_for_target_showtime(
                     continue;
                 }
             };
-            match pick_target_date(cfg, &dates) {
-                Some(d) => d,
-                None => {
-                    wait_or_fail(cfg, "Belum ada tanggal schedule yang aktif.").await?;
-                    continue;
-                }
+            let prioritized = get_prioritized_target_dates(cfg, &dates);
+            if prioritized.is_empty() {
+                wait_or_fail(cfg, "Belum ada tanggal schedule yang aktif sesuai preferensi.").await?;
+                continue;
             }
+            prioritized
         };
 
         // War Strike Measurement: mulai tepat saat request jadwal jam ditembak
         let strike_start = Instant::now();
-        print!("🏟️  Checking schedules for {}...", target_date);
-        let schedules = match api::get_showtimes(&auth.http, &movie.id, &cfg.target.city_id, &target_date).await {
-            Ok(s) => s,
-            Err(e) => {
-                wait_or_fail(cfg, &format!("Jadwal belum tersedia: {}", e)).await?;
-                continue;
+        let mut matched_target: Option<(String, Vec<theater_selector::SelectedShowtime>)> = None;
+
+        for target_date in &target_dates {
+            print!("🏟️  Checking schedules for {}...", target_date);
+            let schedules = match api::get_showtimes(&auth.http, &movie.id, &cfg.target.city_id, target_date).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(date = %target_date, error = %e, "Jadwal belum tersedia untuk tanggal");
+                    continue;
+                }
+            };
+
+            let ranked = theater_selector::rank(
+                &schedules.theaters,
+                &cfg.theater,
+                &cfg.showtime,
+                target_date,
+                &cfg.target.blocked_datetime_ranges,
+            );
+
+            if !ranked.is_empty() {
+                println!(
+                    "\r✅ Found {} theater(s) pada tanggal {}                 ",
+                    ranked.len(),
+                    target_date
+                );
+                matched_target = Some((target_date.clone(), ranked));
+                break;
+            } else {
+                println!(
+                    "\r⏭️  Tanggal {} tidak ada showtime yang cocok.",
+                    target_date
+                );
             }
-        };
+        }
 
-        println!(
-            "\r✅ Found {} theater(s)                 ",
-            schedules.theaters.len()
-        );
-
-        let ranked = theater_selector::rank(
-            &schedules.theaters,
-            &cfg.theater,
-            &cfg.showtime,
-            &target_date,
-            &cfg.target.blocked_datetime_ranges,
-        );
-
-        if !ranked.is_empty() {
+        if let Some((target_date, ranked)) = matched_target {
             return Ok((target_date, ranked, strike_start));
         }
 
         wait_or_fail(
             cfg,
-            "Schedule sudah ada, tapi belum ada showtime yang cocok dengan filter theater/time.",
+            "Schedule sudah ada, tapi belum ada showtime yang cocok dengan filter theater/time pada tanggal target.",
         )
         .await?;
     }
@@ -790,7 +941,7 @@ fn normalize_dt_end(s: &str) -> String {
     if s.len() == 10 { format!("{} 23:59", s) } else { s.to_string() }
 }
 
-fn pick_target_date(cfg: &config::Config, dates: &[crate::models::ScheduleDate]) -> Option<String> {
+fn get_prioritized_target_dates(cfg: &config::Config, dates: &[crate::models::ScheduleDate]) -> Vec<String> {
     let is_blocked = |date: &str| -> bool {
         let day_start = format!("{} 00:00", date);
         let day_end   = format!("{} 23:59", date);
@@ -805,17 +956,34 @@ fn pick_target_date(cfg: &config::Config, dates: &[crate::models::ScheduleDate])
         })
     };
 
-    if cfg.target.date.is_empty() {
+    if !cfg.target.preferred_dates.is_empty() {
+        cfg.target
+            .preferred_dates
+            .iter()
+            .filter(|pref| {
+                dates
+                    .iter()
+                    .any(|d| d.date == **pref && d.is_any_schedule && !is_blocked(&d.date))
+            })
+            .cloned()
+            .collect()
+    } else if cfg.target.date.is_empty() {
         dates
             .iter()
-            .find(|d| d.is_any_schedule && !is_blocked(&d.date))
+            .filter(|d| d.is_any_schedule && !is_blocked(&d.date))
             .map(|d| d.date.clone())
+            .collect()
     } else {
         dates
             .iter()
-            .find(|d| d.date == cfg.target.date && d.is_any_schedule && !is_blocked(&d.date))
+            .filter(|d| d.date == cfg.target.date && d.is_any_schedule && !is_blocked(&d.date))
             .map(|d| d.date.clone())
+            .collect()
     }
+}
+
+fn pick_target_date(cfg: &config::Config, dates: &[crate::models::ScheduleDate]) -> Option<String> {
+    get_prioritized_target_dates(cfg, dates).into_iter().next()
 }
 
 async fn wait_or_fail(cfg: &config::Config, reason: &str) -> Result<()> {
@@ -931,11 +1099,12 @@ mod tests {
                 movie_title: "".into(),
                 city_id: "c1".into(),
                 date: date.into(),
+                preferred_dates: vec![],
                 blocked_datetime_ranges: blocked,
             },
             theater: TheaterConfig { theater_priority: vec![], blocked_theaters: vec![] },
             showtime: ShowtimeConfig { preferred_time_start: "".into(), preferred_time_end: "".into() },
-            seat: SeatConfig { quantity: 2, manual_seats: vec![], avoid_first_rows: 0, preferred_rows: vec![] },
+            seat: SeatConfig { quantity: 2, manual_seats: vec![], avoid_first_rows: 0, preferred_rows: vec![], max_rerolls: 3 },
             device: DeviceConfig { device_id: "dev".into(), longitude: "0".into(), latitude: "0".into() },
             payment: PaymentConfig { payment_method: "M".into(), payment_option: "O".into() },
             polling: PollingConfig { enabled: false, interval_secs: 5, refresh_token_before_secs: 300, start_at: "".into(), beacon_interval_mins: 15 },
@@ -1073,6 +1242,60 @@ mod tests {
         let dates = vec![ScheduleDate { date: "2025-06-01".into(), is_any_schedule: true }];
         // day_start="2025-06-01 00:00" < block_start="2025-06-01 12:00" → not fully covered
         assert_eq!(pick_target_date(&cfg, &dates), Some("2025-06-01".into()));
+    }
+
+    #[test]
+    fn pick_target_date_with_preferred_dates_picks_first_available() {
+        let mut cfg = make_config("", vec![]);
+        cfg.target.preferred_dates = vec!["2025-06-02".into(), "2025-06-03".into()];
+        let dates = vec![
+            ScheduleDate { date: "2025-06-01".into(), is_any_schedule: true },
+            ScheduleDate { date: "2025-06-03".into(), is_any_schedule: true },
+        ];
+        // 2025-06-02 is preferred first but not in list -> falls back to 2025-06-03
+        assert_eq!(pick_target_date(&cfg, &dates), Some("2025-06-03".into()));
+    }
+
+    #[test]
+    fn pick_target_date_with_preferred_dates_prioritizes_order() {
+        let mut cfg = make_config("", vec![]);
+        cfg.target.preferred_dates = vec!["2025-06-02".into(), "2025-06-03".into()];
+        let dates = vec![
+            ScheduleDate { date: "2025-06-03".into(), is_any_schedule: true },
+            ScheduleDate { date: "2025-06-02".into(), is_any_schedule: true },
+        ];
+        // Both are active -> picks 2025-06-02 because it's first in preferred_dates
+        assert_eq!(pick_target_date(&cfg, &dates), Some("2025-06-02".into()));
+    }
+
+    #[test]
+    fn pick_target_date_preferred_dates_skips_blocked_date() {
+        let blocked = vec![vec!["2025-06-02".into(), "2025-06-02".into()]];
+        let mut cfg = make_config("", blocked);
+        cfg.target.preferred_dates = vec!["2025-06-02".into(), "2025-06-03".into()];
+        let dates = vec![
+            ScheduleDate { date: "2025-06-02".into(), is_any_schedule: true },
+            ScheduleDate { date: "2025-06-03".into(), is_any_schedule: true },
+        ];
+        // 2025-06-02 is blocked -> falls back to 2025-06-03
+        assert_eq!(pick_target_date(&cfg, &dates), Some("2025-06-03".into()));
+    }
+
+    #[test]
+    fn get_prioritized_target_dates_returns_all_active_matching_dates() {
+        let mut cfg = make_config("", vec![]);
+        cfg.target.preferred_dates = vec!["2025-06-02".into(), "2025-06-03".into(), "2025-06-04".into()];
+        let dates = vec![
+            ScheduleDate { date: "2025-06-01".into(), is_any_schedule: true },
+            ScheduleDate { date: "2025-06-02".into(), is_any_schedule: true },
+            ScheduleDate { date: "2025-06-03".into(), is_any_schedule: false },
+            ScheduleDate { date: "2025-06-04".into(), is_any_schedule: true },
+        ];
+        // 2025-06-03 is inactive -> returns ["2025-06-02", "2025-06-04"]
+        assert_eq!(
+            get_prioritized_target_dates(&cfg, &dates),
+            vec!["2025-06-02", "2025-06-04"]
+        );
     }
 
     // ── wait_until_start ──────────────────────────────────────────────────

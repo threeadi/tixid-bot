@@ -65,10 +65,12 @@ pub fn print_config_status(cfg: &Config) {
         "(Belum dikonfigurasi)".to_string()
     };
 
-    let date_str = if cfg.target.date.trim().is_empty() {
-        "Otomatis (hari pertama)"
+    let date_str = if !cfg.target.preferred_dates.is_empty() {
+        format!("Multi-Date: {}", cfg.target.preferred_dates.join(" > "))
+    } else if cfg.target.date.trim().is_empty() {
+        "Otomatis (hari pertama)".to_string()
     } else {
-        cfg.target.date.trim()
+        cfg.target.date.trim().to_string()
     };
 
     let time_str = format!(
@@ -118,7 +120,28 @@ fn prompt_target_mode(cfg: &mut Config) {
     }
 
     cfg.target.city_id = prompt("City ID (ID Kota)", &cfg.target.city_id);
-    cfg.target.date = prompt("Tanggal nonton (YYYY-MM-DD, kosong = otomatis)", &cfg.target.date);
+
+    let current_dates = if !cfg.target.preferred_dates.is_empty() {
+        cfg.target.preferred_dates.join(", ")
+    } else {
+        cfg.target.date.clone()
+    };
+    let date_input = prompt("Tanggal nonton (YYYY-MM-DD atau multi-tanggal dipisah koma, kosong = otomatis)", &current_dates);
+    if date_input.contains(',') {
+        cfg.target.preferred_dates = date_input
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        cfg.target.date = cfg.target.preferred_dates.first().cloned().unwrap_or_default();
+    } else {
+        cfg.target.date = date_input.trim().to_string();
+        if !cfg.target.date.is_empty() {
+            cfg.target.preferred_dates = vec![cfg.target.date.clone()];
+        } else {
+            cfg.target.preferred_dates.clear();
+        }
+    }
 
     let default_start = if cfg.showtime.preferred_time_start.contains(' ') {
         cfg.showtime.preferred_time_start.split_whitespace().last().unwrap_or("12:00").to_string()
@@ -206,6 +229,7 @@ pub fn run_setup() -> anyhow::Result<bool> {
         .map(|s| s.trim().to_uppercase())
         .filter(|s| !s.is_empty())
         .collect();
+    cfg.seat.max_rerolls = prompt_usize("Batas maksimal Auto Re-Roll kursi jika bentrok", cfg.seat.max_rerolls);
     println!();
 
     // ── 4. Bioskop ────────────────────────────────────────

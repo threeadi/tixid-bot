@@ -41,6 +41,10 @@ pub struct TargetConfig {
     pub movie_title: String,
     pub city_id: String,
     pub date: String,
+    /// List of target dates in order of preference (e.g. ["2026-10-10", "2026-10-11"]).
+    /// If non-empty, the bot evaluates dates in this priority order, falling back if unavailable.
+    #[serde(default)]
+    pub preferred_dates: Vec<String>,
     /// Datetime ranges to skip. Each entry is ["YYYY-MM-DD HH:MM", "YYYY-MM-DD HH:MM"] (inclusive).
     /// Date-only format ["YYYY-MM-DD", "YYYY-MM-DD"] is also accepted (treated as 00:00–23:59).
     #[serde(default)]
@@ -63,13 +67,23 @@ pub struct ShowtimeConfig {
     pub preferred_time_end: String,
 }
 
+fn default_max_rerolls() -> usize {
+    3
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SeatConfig {
     pub quantity: usize,
+    #[serde(default)]
     pub manual_seats: Vec<String>,
+    #[serde(default)]
     pub avoid_first_rows: usize,
     /// Two-element vec: [start_row, end_row] (e.g. ["D", "H"])
+    #[serde(default)]
     pub preferred_rows: Vec<String>,
+    /// Max auto-reroll attempts when selected seats conflict during order creation (default: 3)
+    #[serde(default = "default_max_rerolls")]
+    pub max_rerolls: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -153,6 +167,7 @@ impl Default for Config {
                 movie_title: String::new(),
                 city_id: String::new(),
                 date: String::new(),
+                preferred_dates: Vec::new(),
                 blocked_datetime_ranges: Vec::new(),
             },
             theater: TheaterConfig {
@@ -168,6 +183,7 @@ impl Default for Config {
                 manual_seats: Vec::new(),
                 avoid_first_rows: 3,
                 preferred_rows: vec!["D".to_string(), "H".to_string()],
+                max_rerolls: 3,
             },
             device: DeviceConfig {
                 device_id: "019e4e4e-f638-7fca-b747-69e48a9eef32".to_string(),
@@ -648,9 +664,54 @@ start_at = ""
         let def = Config::default();
         assert_eq!(def.seat.quantity, 2);
         assert_eq!(def.seat.avoid_first_rows, 3);
+        assert_eq!(def.seat.max_rerolls, 3);
+        assert!(def.target.preferred_dates.is_empty());
         assert_eq!(def.payment.payment_option, "NETWORK_PAY_PG_QRIS");
         assert!(def.notification.desktop_enabled);
         assert!(def.notification.desktop_sound);
+    }
+
+    #[test]
+    fn deserialize_preferred_dates_and_max_rerolls() {
+        let toml_str = r#"
+[auth]
+msisdn = "08123"
+password = "pw"
+
+[target]
+city_id = "c1"
+date = "2026-10-10"
+preferred_dates = ["2026-10-10", "2026-10-11"]
+
+[theater]
+theater_priority = []
+
+[showtime]
+preferred_time_start = ""
+preferred_time_end = ""
+
+[seat]
+quantity = 2
+max_rerolls = 5
+
+[device]
+device_id = "d"
+longitude = "0"
+latitude = "0"
+
+[payment]
+payment_method = "M"
+payment_option = "O"
+
+[polling]
+enabled = false
+interval_secs = 2
+refresh_token_before_secs = 60
+start_at = ""
+"#;
+        let c: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(c.target.preferred_dates, vec!["2026-10-10", "2026-10-11"]);
+        assert_eq!(c.seat.max_rerolls, 5);
     }
 
     #[test]

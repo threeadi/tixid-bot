@@ -15,6 +15,12 @@ movie_title = "Avengers: Doomsday"
 city_id = "973818515335155712"
 # Tanggal nonton (format YYYY-MM-DD). Kosongkan ("") untuk otomatis pakai tanggal pertama tersedia.
 date = ""
+# Prioritas multi-tanggal (Multi-Date Priority).
+# Bot akan mengecek tanggal berdasarkan urutan prioritas di bawah ini.
+# Jika tanggal pertama belum buka atau kursi habis, otomatis fallback ke tanggal berikutnya.
+# Contoh: ["2026-10-10", "2026-10-11"] (utamakan Sabtu, jika habis/belum ada pindah ke Minggu).
+# Kosongkan [] jika hanya memakai setting `date` di atas.
+preferred_dates = []
 # Datetime yang diblok — bot akan skip showtime dalam range ini.
 # Format: ["YYYY-MM-DD HH:MM", "YYYY-MM-DD HH:MM"] (inklusif).
 # Format tanggal saja ["YYYY-MM-DD", "YYYY-MM-DD"] juga diterima (= seluruh hari 00:00–23:59).
@@ -51,6 +57,10 @@ manual_seats = []
 avoid_first_rows = 3
 # Range baris yang disukai [baris_awal, baris_akhir] inklusif. [] = semua baris tersedia.
 preferred_rows = ["D", "H"]
+# Batas maksimal auto re-roll kursi saat terjadi konflik (kursi diambil orang lain).
+# Jika kursi bentrok, bot langsung re-roll kursi terbaik berikutnya di studio yang sama (tanpa jeda).
+# Default: 3
+max_rerolls = 3
 
 [device]
 # Device ID (bisa salin dari browser DevTools, atau biarkan default)

@@ -22,9 +22,17 @@ fn seat_col(label: &str) -> Option<usize> {
 /// Find `quantity` consecutive available seats in `sm` whose center column is
 /// closest to the row's midpoint.  Returns `None` if not enough seats exist.
 ///
+/// Find `quantity` consecutive available seats in `sm` whose center column is
+/// closest to the row's midpoint.  Returns `None` if not enough seats exist.
+///
 /// "Consecutive" means adjacent column numbers AND the same `grid_cd` section
 /// (so seats on opposite sides of a centre aisle are never grouped together).
-fn best_consecutive(sm: &SeatMap, quantity: usize) -> Option<Vec<SelectedSeat>> {
+/// Excluded seats (by label or booking_id) are treated as unavailable.
+fn best_consecutive(
+    sm: &SeatMap,
+    quantity: usize,
+    excluded: &HashSet<String>,
+) -> Option<Vec<SelectedSeat>> {
     // Build col → &SeatRow for availability checking and booking-ID lookup.
     let seat_by_col: std::collections::HashMap<usize, &SeatRow> = sm
         .seat_rows
@@ -34,7 +42,11 @@ fn best_consecutive(sm: &SeatMap, quantity: usize) -> Option<Vec<SelectedSeat>> 
 
     let mut available: Vec<usize> = seat_by_col
         .iter()
-        .filter(|(_, sr)| sr.status == 1)
+        .filter(|(_, sr)| {
+            sr.status == 1
+                && !excluded.contains(&sr.seat_row)
+                && !sr.booking_id.as_ref().map(|b| excluded.contains(b)).unwrap_or(false)
+        })
         .map(|(col, _)| *col)
         .collect();
     available.sort_unstable();
@@ -88,28 +100,31 @@ fn best_consecutive(sm: &SeatMap, quantity: usize) -> Option<Vec<SelectedSeat>> 
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Select `config.quantity` seats from `seat_map`.
+/// Select `config.quantity` seats from `seat_map`, ignoring any seat whose label
+/// or booking ID is present in `excluded`.
 ///
-/// Row orientation (tix.id): A = back (far from screen), larger letters = closer to screen.
-///
-/// Algorithm:
-/// 1. If `manual_seats` are all available → return them.
-/// 2. Auto-select:
-///    a. Skip the last `avoid_first_rows` rows (front = closest to screen = largest letters).
-///    b. Among remaining rows, try `preferred_rows` range first (center-out order).
-///    c. Fall back to other rows if the preferred range has no group.
-pub fn select(seat_map: &[SeatMap], config: &SeatConfig) -> Option<Vec<SelectedSeat>> {
+/// Useful for automatic re-roll when initially selected seats conflict or are taken
+/// milliseconds earlier during a ticket war.
+pub fn select_with_exclusions(
+    seat_map: &[SeatMap],
+    config: &SeatConfig,
+    excluded: &HashSet<String>,
+) -> Option<Vec<SelectedSeat>> {
     // Precompute available seat labels once — O(total_seats) — so all
     // subsequent lookups are O(1) instead of O(rows × seats_per_row).
     let seat_row_lookup: std::collections::HashMap<&str, &SeatRow> = seat_map
         .iter()
         .flat_map(|sm| sm.seat_rows.iter())
-        .filter(|sr| sr.status == 1)
+        .filter(|sr| {
+            sr.status == 1
+                && !excluded.contains(&sr.seat_row)
+                && !sr.booking_id.as_ref().map(|b| excluded.contains(b)).unwrap_or(false)
+        })
         .map(|sr| (sr.seat_row.as_str(), sr))
         .collect();
     let available_set: HashSet<&str> = seat_row_lookup.keys().copied().collect();
 
-    // 1. Manual seats
+    // 1. Manual seats (only if all requested seats are available and not excluded)
     if !config.manual_seats.is_empty() {
         let all_ok = config
             .manual_seats
@@ -204,12 +219,27 @@ pub fn select(seat_map: &[SeatMap], config: &SeatConfig) -> Option<Vec<SelectedS
 
     // Try preferred (center-out) then fallback rows in order
     for sm in ordered.iter().chain(fallback.iter()) {
-        if let Some(seats) = best_consecutive(sm, config.quantity) {
+        if let Some(seats) = best_consecutive(sm, config.quantity, excluded) {
             return Some(seats);
         }
     }
 
     None
+}
+
+/// Select `config.quantity` seats from `seat_map`.
+///
+/// Row orientation (tix.id): A = back (far from screen), larger letters = closer to screen.
+///
+/// Algorithm:
+/// 1. If `manual_seats` are all available → return them.
+/// 2. Auto-select:
+///    a. Skip the last `avoid_first_rows` rows (front = closest to screen = largest letters).
+///    b. Among remaining rows, try `preferred_rows` range first (center-out order).
+///    c. Fall back to other rows if the preferred range has no group.
+pub fn select(seat_map: &[SeatMap], config: &SeatConfig) -> Option<Vec<SelectedSeat>> {
+    let empty = HashSet::new();
+    select_with_exclusions(seat_map, config, &empty)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -240,6 +270,7 @@ mod tests {
             manual_seats: manual.into_iter().map(|s| s.to_string()).collect(),
             avoid_first_rows: avoid,
             preferred_rows: preferred.into_iter().map(|s| s.to_string()).collect(),
+            max_rerolls: 3,
         }
     }
 
@@ -409,5 +440,100 @@ mod tests {
         // 3-seat group cannot cross aisle
         let result3 = select(&map, &cfg(3, vec![], 0, vec![]));
         assert!(result3.is_none());
+    }
+
+    // ── select_with_exclusions ────────────────────────────────────────────
+
+    #[test]
+    fn select_with_exclusions_skips_contested_seats_and_picks_next_pair() {
+        // Row D has D1..D6 available. Midpoint is ~3-4.
+        // First selection picks D3+D4 or D2+D3.
+        let map = vec![make_sm("D", 6, vec![
+            make_sr("D1", 1, None, None, None),
+            make_sr("D2", 1, None, None, None),
+            make_sr("D3", 1, None, None, None),
+            make_sr("D4", 1, None, None, None),
+            make_sr("D5", 1, None, None, None),
+            make_sr("D6", 1, None, None, None),
+        ])];
+
+        let first = select(&map, &cfg(2, vec![], 0, vec![])).unwrap();
+        let first_labels: Vec<_> = first.iter().map(|s| s.display.clone()).collect();
+        assert_eq!(first_labels.len(), 2);
+
+        // Exclude the first selected seats (simulate conflict during order creation)
+        let mut excluded = HashSet::new();
+        for label in &first_labels {
+            excluded.insert(label.clone());
+        }
+
+        // Re-roll should pick another consecutive pair
+        let second = select_with_exclusions(&map, &cfg(2, vec![], 0, vec![]), &excluded).unwrap();
+        let second_labels: Vec<_> = second.iter().map(|s| s.display.clone()).collect();
+        assert_eq!(second_labels.len(), 2);
+        assert_ne!(first_labels, second_labels);
+        assert!(!second_labels.contains(&first_labels[0]));
+        assert!(!second_labels.contains(&first_labels[1]));
+    }
+
+    #[test]
+    fn select_with_exclusions_falls_back_to_next_row_when_row_exhausted() {
+        // D has only D1+D2, E has E1+E2.
+        let map = vec![
+            make_sm("D", 4, vec![
+                make_sr("D1", 1, None, None, None),
+                make_sr("D2", 1, None, None, None),
+            ]),
+            make_sm("E", 4, vec![
+                make_sr("E1", 1, None, None, None),
+                make_sr("E2", 1, None, None, None),
+            ]),
+        ];
+
+        let mut excluded = HashSet::new();
+        excluded.insert("D1".to_string());
+        excluded.insert("D2".to_string());
+
+        let result = select_with_exclusions(&map, &cfg(2, vec![], 0, vec!["D", "E"]), &excluded).unwrap();
+        assert_eq!(result[0].display, "E1");
+        assert_eq!(result[1].display, "E2");
+    }
+
+    #[test]
+    fn select_with_exclusions_manual_seats_conflict_falls_back_to_auto() {
+        let map = vec![
+            make_sm("A", 4, vec![
+                make_sr("A1", 1, None, None, None),
+                make_sr("A2", 1, None, None, None),
+            ]),
+            make_sm("B", 4, vec![
+                make_sr("B1", 1, None, None, None),
+                make_sr("B2", 1, None, None, None),
+            ]),
+        ];
+
+        // Manual wanted A1+A2, but A1 is contested/excluded
+        let mut excluded = HashSet::new();
+        excluded.insert("A1".to_string());
+
+        let config = cfg(2, vec!["A1", "A2"], 0, vec![]);
+        let result = select_with_exclusions(&map, &config, &excluded).unwrap();
+        // Since manual failed due to exclusion, it auto-selects B1+B2
+        assert_eq!(result[0].display, "B1");
+        assert_eq!(result[1].display, "B2");
+    }
+
+    #[test]
+    fn select_with_exclusions_all_exhausted_returns_none() {
+        let map = vec![make_sm("A", 2, vec![
+            make_sr("A1", 1, None, None, None),
+            make_sr("A2", 1, None, None, None),
+        ])];
+
+        let mut excluded = HashSet::new();
+        excluded.insert("A1".to_string());
+        excluded.insert("A2".to_string());
+
+        assert!(select_with_exclusions(&map, &cfg(2, vec![], 0, vec![]), &excluded).is_none());
     }
 }
