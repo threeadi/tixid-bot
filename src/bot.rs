@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
-use crate::{api, client, config, seat_selector, theater_selector};
+use crate::{api, client, config, notifier, seat_selector, theater_selector};
 
 struct AuthSession {
     http: Client,
@@ -23,7 +23,7 @@ pub async fn run() -> Result<()> {
     println!("========================================");
 
     // ── 1. Load config ───────────────────────────────────────────────────────
-    let cfg = config::load()?;
+    let mut cfg = config::load()?;
     wait_until_start(&cfg.polling.start_at).await?;
 
     let bot_start = Instant::now();
@@ -32,7 +32,7 @@ pub async fn run() -> Result<()> {
     let mut auth = authenticate(&cfg).await?;
 
     // ── 3. Poll until movie schedule/showtime is ready ──────────────────────
-    let (movie, target_date, ranked) = wait_for_target_showtime(&cfg, &mut auth).await?;
+    let (movie, target_date, ranked) = wait_for_target_showtime(&mut cfg, &mut auth).await?;
 
     // ── 4 & 5. Find theater with N consecutive seats (try in priority order) ─
     let (selected, layout, seats) =
@@ -186,6 +186,33 @@ pub async fn run() -> Result<()> {
         println!("   ⚠️  Scan QRIS above before {} WIB", expiry_str);
     }
     println!("========================================");
+
+    let qr_url = if !payment.payment_code.is_empty() {
+        format!(
+            "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={}",
+            urlencoding::encode(&payment.payment_code)
+        )
+    } else {
+        String::new()
+    };
+
+    let notif_payload = notifier::OrderNotificationPayload {
+        order_id: order.id,
+        movie_name: order.movie_name,
+        theater_name: order.theater_name,
+        studio_name: order.studio_name,
+        selected_seats: order.selected_seats,
+        quantity: order.quantity,
+        ticket_price: order.total_ticket_price,
+        convenience_fee: order.convenience_fee,
+        total_payment: payment.total_payment,
+        payment_option: payment.payment_option,
+        expired_at_wib: expiry_str,
+        payment_code: payment.payment_code,
+        qr_image_url: qr_url,
+    };
+
+    notifier::notify_checkout(&cfg.notification, &notif_payload).await;
 
     Ok(())
 }
@@ -391,10 +418,14 @@ async fn try_theaters_for_seats(
 }
 
 async fn wait_for_target_showtime(
-    cfg: &config::Config,
+    cfg: &mut config::Config,
     auth: &mut AuthSession,
 ) -> Result<(crate::models::MovieData, String, Vec<theater_selector::SelectedShowtime>)> {
+    let mut last_modified = None;
     loop {
+        // Cek jika config.toml diedit di background saat standby/polling
+        config::check_and_reload(&mut last_modified, cfg);
+
         refresh_auth_if_needed(cfg, auth).await?;
 
         print!("🎥 Fetching movie {}...", cfg.target.movie_id);
@@ -580,6 +611,7 @@ mod tests {
             device: DeviceConfig { device_id: "dev".into(), longitude: "0".into(), latitude: "0".into() },
             payment: PaymentConfig { payment_method: "M".into(), payment_option: "O".into() },
             polling: PollingConfig { enabled: false, interval_secs: 5, refresh_token_before_secs: 300, start_at: "".into() },
+            notification: Default::default(),
         }
     }
 

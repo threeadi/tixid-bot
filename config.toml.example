@@ -69,3 +69,15 @@ refresh_token_before_secs = 1500
 # WIB, format: "YYYY-MM-DD HH:MM:SS". Kosongkan "" untuk mulai sekarang.
 start_at = ""
 
+[notification]
+# Tampilkan pop-up notifikasi desktop OS (Windows Toast)
+desktop_enabled = true
+# Bunyikan suara alert terminal saat tiket berhasil di-checkout
+desktop_sound = true
+# Kirim notifikasi lengkap ke Discord webhook
+discord_enabled = false
+# URL Webhook Discord (contoh: "https://discord.com/api/webhooks/...")
+discord_webhook_url = ""
+# Opsional mention di Discord (contoh: "@everyone", "<@USER_ID>", atau "<@&ROLE_ID>"). Kosongkan jika tanpa mention.
+discord_mention = ""
+

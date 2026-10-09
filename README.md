@@ -6,64 +6,65 @@ Target: secepat mungkin dari start → seat hold → QRIS payment.
 
 ---
 
-## ✅ TODO List
+## ✅ Fitur (v1.0.0-beta)
 
-### v1.0 — Core Bot ✅ DONE
-
-- [x] `src/config.rs` — Load & parse `config.toml` (termasuk `theater_priority` array, `latitude`/`longitude`)
-- [x] `src/models.rs` — Semua struct request/response (auth, login, movie, schedule, seat, order, checkout)
+### 🚀 Core Bot & Automation
+- [x] `src/config.rs` — Load, save, & parse `config.toml` (termasuk `theater_priority`, geolokasi, dll)
+- [x] `src/models.rs` — Semua struct request/response serde
 - [x] `src/client.rs` — HTTP client dengan default headers (Authorization, device_id, platform, dll)
-- [x] `src/api.rs`
-    - [x] `get_guest_token()` → anonymous token (wajib sebelum login)
-    - [x] `login(msisdn, password)` → JWT token
-    - [x] `get_movie(movie_id)` → detail film + schedule_id
-    - [x] `get_schedule_dates(schedule_id, city_id)` → daftar tanggal tersedia
-    - [x] `get_showtimes(schedule_id, city_id, date)` → daftar bioskop + jadwal
-    - [x] `get_seat_layout(merchant_slug, show_time_id)` → peta kursi
-    - [x] `create_order(merchant_id, time_show_id, seats)` → order created
-    - [x] `get_payment_channels(order_id)` → daftar metode pembayaran
-    - [x] `checkout(order_id, lat, lng, method, option)` → QRIS / payment code
-- [x] `src/theater_selector.rs` — Algoritma pilih bioskop berdasarkan `theater_priority`
+- [x] `src/api.rs` — Wrapper lengkap endpoint TIX.ID (auth guest, login, movie, schedule dates, showtimes, layout, create order, checkout)
+- [x] `src/theater_selector.rs` — Algoritma seleksi & ranking bioskop
 - [x] `src/seat_selector.rs` — Algoritma pilih kursi (manual → auto center-out → fallback)
 - [x] `src/bot.rs` — Orkestrasi alur utama full end-to-end
-- [x] `src/main.rs` — Entry point
+- [x] `src/main.rs` — Entry point & interactive startup menu
 
-### v1.1 — Payment ✅ DONE
-
+### 💳 Checkout & QRIS
 - [x] Checkout API dengan `request_id`, `latitude`, `longitude`
 - [x] Default payment method QRIS (`NETWORK_PAY_PG_QRIS`)
 - [x] Render QR code di terminal (Unicode block characters)
 - [x] Tampilkan QR image URL (`api.qrserver.com`)
 
-### v1.2 — Sniper Mode ✅ DONE
-
+### 🎯 Sniper Mode
 - [x] Loop polling jadwal yang belum buka booking (film `UPCOMING`)
 - [x] Langsung eksekusi begitu jadwal/showtime muncul
 - [x] Auto-refresh token saat standby lama
-- [x] `start_at` timer — bot tidur sampai waktu tertentu (WIB), lalu mulai war
+- [x] `start_at` war timer — bot standby sampai waktu tertentu (WIB), lalu mulai war
 
-### v1.3 — Logging ✅ DONE
-
-- [x] Non-blocking async logging ke file `tixid-bot.log` (channel-based, tidak block hot path)
+### 📝 Async Logging
+- [x] Non-blocking async logging ke file `tixid-bot.log` (tracing-appender, channel-based)
 - [x] Log semua request body dan response JSON ke file
 - [x] Audit events: login, showtime selected, seats selected, order created, checkout completed
-- [x] Error API (response `success: false`) di-handle dengan pesan yang jelas
+- [x] Error API di-handle dengan pesan yang jelas
 
-### v1.4 — Smart Seating ✅ DONE
-
+### ⚡ Smart Seating & Parallel Race
 - [x] Ranking semua bioskop sesuai `theater_priority`
 - [x] Parallel seat layout fetch — semua request dikirim serentak
 - [x] Signaling: pemenang dikonfirmasi sesuai ranking, bukan siapa yang reply duluan
 - [x] Abort otomatis semua in-flight request begitu pemenang dikonfirmasi
 - [x] Fallback ke bioskop berikutnya jika tidak ada N kursi berurutan
 
-### v1.5 — Multi-format Seat Layout ✅ DONE
-
+### 💺 Multi-format Seat Layout
 - [x] Auto-deteksi format seat layout: XXI (nested `seat_map`) vs Cinepolis/CGV (flat list)
 - [x] `SelectedSeat` struct membawa `seat_id` (booking ID), `display` (label), `grd_cd` (price tier)
 - [x] Kirim `seat_grd_cd` yang benar ke `create_order` (kode tier harga, bukan seat_id)
 - [x] Grid/aisle awareness: kursi di sisi kanan/kiri lorong tengah Cinepolis tidak dianggap berurutan
 - [x] Spacer/aisle marker (`seat_yn: "0"`) difilter otomatis dari Cinepolis/CGV layout
+
+### 🔔 Notifikasi Multi-channel
+- [x] `src/notifier.rs` — Modul notifikasi checkout & QRIS
+- [x] Windows Toast Notification (pop-up desktop OS dengan ringkasan tiket dan batas bayar)
+- [x] Terminal audio alert (bell/beep speaker PC saat checkout berhasil)
+- [x] Discord Webhook (Rich Embed: info film, bioskop, kursi, total bayar, batas bayar, dan render gambar QRIS)
+- [x] Konfigurasi mention Discord (`discord_mention`) untuk ping user/role/@everyone
+- [x] Resilient & non-blocking: kegagalan pengiriman notifikasi tidak menggagalkan bot
+
+### 🛠️ Interactive Setup Wizard & Live Hot-Reload
+- [x] `src/wizard.rs` — Setup wizard interaktif di terminal dengan nilai default (tekan Enter untuk pertahankan nilai)
+- [x] Menu pembuka saat `.exe` dibuka: `[1] Mulai Bot`, `[2] Ubah Pengaturan (Wizard)`, `[3] Keluar`
+- [x] Auto-trigger wizard jika `config.toml` belum ada
+- [x] Live Hot-Reload saat runtime: deteksi otomatis perubahan `config.toml` saat standby/polling tanpa restart
+- [x] Portable `.exe` path awareness: mendeteksi `config.toml` di direktori yang sama dengan binary `.exe`
+- [x] Flag CLI: `--setup` untuk wizard langsung, `--no-interactive` untuk bypass menu (otomasi/script)
 
 ### Prerequisites
 
@@ -304,8 +305,10 @@ tixid-bot/
     ├── client.rs         ← HTTP client + default headers
     ├── api.rs            ← fungsi pemanggil API (log request+response otomatis)
     ├── logger.rs         ← non-blocking async file logger (tracing-appender)
+    ├── notifier.rs       ← modul notifikasi desktop & Discord webhook
     ├── theater_selector.rs ← algoritma pilih bioskop
     ├── seat_selector.rs  ← algoritma pilih kursi
+    ├── wizard.rs         ← interactive setup wizard terminal
     └── bot.rs            ← orkestrasi alur utama
 ```
 
@@ -322,10 +325,5 @@ tixid-bot/
 
 | Versi | Status     | Fitur                                                               |
 | ----- | ---------- | ------------------------------------------------------------------- |
-| v1.0  | ✅ Done    | Login → cari film → pilih jadwal → auto-select kursi → create order |
-| v1.1  | ✅ Done    | QRIS checkout + render QR di terminal                               |
-| v1.2  | ✅ Done    | Sniper mode (polling + `start_at` war timer)                        |
-| v1.3  | ✅ Done    | Non-blocking async file logging                                     |
-| v1.4  | ✅ Done    | Smart Seating: parallel race, winner by rank, abort losers          |
-| v1.5  | ✅ Done    | Multi-format layout (XXI/Cinepolis/CGV) + grid/aisle-aware seating  |
-| v1.6  | 📋 Planned | Multi-account support (concurrent)                                  |
+| v1.0.0-beta | ✅ Done | Core Bot, QRIS Checkout, Sniper Mode, Async Logging, Smart Seating, Multi-format Layout, Notifikasi Multi-channel, Interactive Wizard & Live Hot-Reload |
+| v1.1.0 | 📋 Planned | Multi-account support (concurrent)                                  |

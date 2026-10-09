@@ -1,7 +1,10 @@
-use anyhow::Result;
-use serde::Deserialize;
+use std::path::PathBuf;
+use std::time::SystemTime;
 
-#[derive(Debug, Deserialize, Clone)]
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     pub auth: AuthConfig,
     pub target: TargetConfig,
@@ -11,15 +14,17 @@ pub struct Config {
     pub device: DeviceConfig,
     pub payment: PaymentConfig,
     pub polling: PollingConfig,
+    #[serde(default)]
+    pub notification: NotificationConfig,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AuthConfig {
     pub msisdn: String,
     pub password: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TargetConfig {
     pub movie_id: String,
     pub city_id: String,
@@ -30,7 +35,7 @@ pub struct TargetConfig {
     pub blocked_datetime_ranges: Vec<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TheaterConfig {
     pub theater_priority: Vec<String>,
     /// Theaters to always skip (substring match, case-insensitive).
@@ -38,7 +43,7 @@ pub struct TheaterConfig {
     pub blocked_theaters: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ShowtimeConfig {
     /// "HH:MM" or "YYYY-MM-DD HH:MM". Empty = no bound.
     pub preferred_time_start: String,
@@ -46,7 +51,7 @@ pub struct ShowtimeConfig {
     pub preferred_time_end: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SeatConfig {
     pub quantity: usize,
     pub manual_seats: Vec<String>,
@@ -55,14 +60,14 @@ pub struct SeatConfig {
     pub preferred_rows: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DeviceConfig {
     pub device_id: String,
     pub longitude: String,
     pub latitude: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PaymentConfig {
     /// e.g. "NETWORK_PAY"
     pub payment_method: String,
@@ -70,7 +75,7 @@ pub struct PaymentConfig {
     pub payment_option: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PollingConfig {
     /// Keep polling instead of failing immediately when schedule is not ready.
     pub enabled: bool,
@@ -82,12 +87,188 @@ pub struct PollingConfig {
     pub start_at: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct NotificationConfig {
+    /// Show native desktop notification (Windows toast)
+    #[serde(default = "default_true")]
+    pub desktop_enabled: bool,
+    /// Play terminal bell sound upon checkout
+    #[serde(default = "default_true")]
+    pub desktop_sound: bool,
+    /// Send notification to Discord webhook
+    #[serde(default)]
+    pub discord_enabled: bool,
+    /// Discord webhook URL
+    #[serde(default)]
+    pub discord_webhook_url: String,
+    /// Optional Discord mention string (e.g. "@everyone", "<@USER_ID>", "<@&ROLE_ID>")
+    #[serde(default)]
+    pub discord_mention: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            desktop_enabled: true,
+            desktop_sound: true,
+            discord_enabled: false,
+            discord_webhook_url: String::new(),
+            discord_mention: String::new(),
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            auth: AuthConfig {
+                msisdn: String::new(),
+                password: String::new(),
+            },
+            target: TargetConfig {
+                movie_id: String::new(),
+                city_id: String::new(),
+                date: String::new(),
+                blocked_datetime_ranges: Vec::new(),
+            },
+            theater: TheaterConfig {
+                theater_priority: Vec::new(),
+                blocked_theaters: Vec::new(),
+            },
+            showtime: ShowtimeConfig {
+                preferred_time_start: String::new(),
+                preferred_time_end: String::new(),
+            },
+            seat: SeatConfig {
+                quantity: 2,
+                manual_seats: Vec::new(),
+                avoid_first_rows: 3,
+                preferred_rows: vec!["D".to_string(), "H".to_string()],
+            },
+            device: DeviceConfig {
+                device_id: "019e4e4e-f638-7fca-b747-69e48a9eef32".to_string(),
+                longitude: "112.76613449641758".to_string(),
+                latitude: "-8.210285710686566".to_string(),
+            },
+            payment: PaymentConfig {
+                payment_method: "NETWORK_PAY".to_string(),
+                payment_option: "NETWORK_PAY_PG_QRIS".to_string(),
+            },
+            polling: PollingConfig {
+                enabled: true,
+                interval_secs: 2,
+                refresh_token_before_secs: 1500,
+                start_at: String::new(),
+            },
+            notification: NotificationConfig::default(),
+        }
+    }
+}
+
+/// Menentukan lokasi config.toml secara dinamis (mengutamakan folder yang sama dengan binary .exe).
+pub fn get_config_path() -> PathBuf {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            let candidate = parent.join("config.toml");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+
+    let cwd_candidate = PathBuf::from("config.toml");
+    if cwd_candidate.exists() {
+        return cwd_candidate;
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            return parent.join("config.toml");
+        }
+    }
+
+    PathBuf::from("config.toml")
+}
+
+/// Cek apakah config.toml ada.
+pub fn config_exists() -> bool {
+    get_config_path().exists()
+}
+
 pub fn load() -> Result<Config> {
-    let text = std::fs::read_to_string("config.toml")
-        .map_err(|e| anyhow::anyhow!("Cannot read config.toml: {}", e))?;
+    let path = get_config_path();
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("Cannot read {}: {}", path.display(), e))?;
     let config: Config = toml::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("Cannot parse config.toml: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Cannot parse {}: {}", path.display(), e))?;
     Ok(config)
+}
+
+pub fn save(config: &Config) -> Result<()> {
+    let path = get_config_path();
+    let text = toml::to_string_pretty(config)
+        .map_err(|e| anyhow::anyhow!("Cannot serialize config: {}", e))?;
+    std::fs::write(&path, text)
+        .map_err(|e| anyhow::anyhow!("Cannot write {}: {}", path.display(), e))?;
+    Ok(())
+}
+
+/// Memeriksa apakah config.toml telah dimodifikasi di disk.
+/// Jika ya dan parsing berhasil, memperbarui `current_config` dan mengembalikan `true`.
+pub fn check_and_reload(
+    last_modified: &mut Option<SystemTime>,
+    current_config: &mut Config,
+) -> bool {
+    let path = get_config_path();
+    let metadata = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    let modified = match metadata.modified() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    if let Some(prev) = *last_modified {
+        if modified <= prev {
+            return false;
+        }
+    } else {
+        *last_modified = Some(modified);
+        return false;
+    }
+
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            match toml::from_str::<Config>(&text) {
+                Ok(new_cfg) => {
+                    *current_config = new_cfg;
+                    *last_modified = Some(modified);
+                    println!(
+                        "\n🔄 [Hot-Reload] config.toml telah diperbarui dan berhasil dimuat ulang!"
+                    );
+                    tracing::info!("config.toml hot-reloaded successfully");
+                    true
+                }
+                Err(e) => {
+                    println!("\n⚠️  [Hot-Reload] Perubahan pada config.toml memiliki kesalahan sintaks: {}", e);
+                    println!("    Menggunakan konfigurasi valid sebelumnya tanpa berhenti.");
+                    tracing::warn!(error = %e, "config.toml reload failed due to syntax error");
+                    *last_modified = Some(modified);
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to read modified config.toml");
+            false
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -180,6 +361,74 @@ start_at = ""
     }
 
     #[test]
+    fn deserialize_notification_defaults() {
+        let c: Config = toml::from_str(MINIMAL).unwrap();
+        assert!(c.notification.desktop_enabled);
+        assert!(c.notification.desktop_sound);
+        assert!(!c.notification.discord_enabled);
+        assert_eq!(c.notification.discord_webhook_url, "");
+        assert_eq!(c.notification.discord_mention, "");
+    }
+
+    #[test]
+    fn deserialize_notification_custom_fields() {
+        let toml_str = r#"
+[auth]
+msisdn = "08123"
+password = "pw"
+
+[target]
+movie_id = "m1"
+city_id = "c1"
+date = ""
+
+[theater]
+theater_priority = []
+
+[showtime]
+preferred_time_start = ""
+preferred_time_end = ""
+
+[seat]
+quantity = 1
+manual_seats = []
+avoid_first_rows = 0
+preferred_rows = []
+
+[device]
+device_id = "d"
+longitude = "0"
+latitude = "0"
+
+[payment]
+payment_method = "M"
+payment_option = "O"
+
+[polling]
+enabled = false
+interval_secs = 5
+refresh_token_before_secs = 60
+start_at = ""
+
+[notification]
+desktop_enabled = false
+desktop_sound = false
+discord_enabled = true
+discord_webhook_url = "https://discord.com/api/webhooks/test"
+discord_mention = "<@123456789>"
+"#;
+        let c: Config = toml::from_str(toml_str).unwrap();
+        assert!(!c.notification.desktop_enabled);
+        assert!(!c.notification.desktop_sound);
+        assert!(c.notification.discord_enabled);
+        assert_eq!(
+            c.notification.discord_webhook_url,
+            "https://discord.com/api/webhooks/test"
+        );
+        assert_eq!(c.notification.discord_mention, "<@123456789>");
+    }
+
+    #[test]
     fn deserialize_device_fields() {
         let c: Config = toml::from_str(MINIMAL).unwrap();
         assert_eq!(c.device.device_id, "dev-001");
@@ -247,7 +496,10 @@ start_at = ""
 "#;
         let c: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(c.target.blocked_datetime_ranges.len(), 2);
-        assert_eq!(c.target.blocked_datetime_ranges[0], vec!["2025-06-01", "2025-06-01"]);
+        assert_eq!(
+            c.target.blocked_datetime_ranges[0],
+            vec!["2025-06-01", "2025-06-01"]
+        );
         assert_eq!(c.theater.blocked_theaters, vec!["Cinepolis", "TGV"]);
         assert_eq!(c.seat.manual_seats, vec!["D5"]);
         assert!(c.polling.enabled);
@@ -272,5 +524,31 @@ start_at = ""
         // Verify the error-path of std::fs::read_to_string for a missing file
         let result = std::fs::read_to_string("__no_such_config_file__.toml");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_default_has_expected_values() {
+        let def = Config::default();
+        assert_eq!(def.seat.quantity, 2);
+        assert_eq!(def.seat.avoid_first_rows, 3);
+        assert_eq!(def.payment.payment_option, "NETWORK_PAY_PG_QRIS");
+        assert!(def.notification.desktop_enabled);
+        assert!(def.notification.desktop_sound);
+    }
+
+    #[test]
+    fn serialize_and_deserialize_roundtrip() {
+        let original: Config = toml::from_str(MINIMAL).unwrap();
+        let serialized = toml::to_string_pretty(&original).expect("serialize should succeed");
+        let parsed: Config =
+            toml::from_str(&serialized).expect("deserialize roundtrip should succeed");
+        assert_eq!(original.auth.msisdn, parsed.auth.msisdn);
+        assert_eq!(original.auth.password, parsed.auth.password);
+        assert_eq!(original.target.movie_id, parsed.target.movie_id);
+        assert_eq!(original.seat.quantity, parsed.seat.quantity);
+        assert_eq!(
+            original.payment.payment_option,
+            parsed.payment.payment_option
+        );
     }
 }

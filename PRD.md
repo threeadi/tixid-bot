@@ -10,15 +10,17 @@ Target: secepat mungkin dari login → seat hold (order created).
 
 ## 2. Tech Stack
 
-| Komponen           | Library                     |
-| ------------------ | --------------------------- |
-| HTTP client        | `reqwest` 0.12 (rustls-tls) |
-| Async runtime      | `tokio`                     |
-| JSON (de)serialize | `serde` + `serde_json`      |
-| Config file        | `toml`                      |
-| Error handling     | `anyhow`                    |
-| UUID (request_id)  | `uuid` v4                   |
-| Time display       | `chrono`                    |
+| Komponen           | Library                                                     |
+| ------------------ | ----------------------------------------------------------- |
+| HTTP client        | `reqwest` 0.12 (rustls-tls)                                 |
+| Async runtime      | `tokio`                                                     |
+| JSON (de)serialize | `serde` + `serde_json`                                      |
+| Config file        | `toml` (de/serialization)                                   |
+| Error handling     | `anyhow`                                                    |
+| UUID (request_id)  | `uuid` v4                                                   |
+| Time display       | `chrono`                                                    |
+| QR Code Render     | `qrcode` (terminal) + `urlencoding`                         |
+| Notifikasi Desktop | `notify-rust` (Windows Toast)                               |
 
 ---
 
@@ -33,17 +35,16 @@ password = "<RSA-encrypted-password>"   # salin dari browser DevTools
 movie_id = "2039608798242488320"        # ID dari URL tix.id
 city_id  = "973818515335155712"         # Malang
 date     = ""                           # kosong = auto (tanggal pertama tersedia)
+blocked_datetime_ranges = []            # range tanggal/jam yang ingin diskip
 
 [theater]
-# Urutan prioritas bioskop (nama substring, case-insensitive).
-# Bot mencoba dari index pertama; jika tidak ada jadwal valid → coba berikutnya.
-# Kosongkan [] untuk tidak ada preferensi (pakai bioskop pertama yang tersedia).
 theater_priority = [
     "TRANSMART MX MALL XXI",
     "MALANG TOWN SQUARE CINEPOLIS",
     "ARAYA XXI",
     "MALANG CITY POINT CGV",
 ]
+blocked_theaters = []                   # bioskop yang selalu diskip
 
 [showtime]
 preferred_time_start = "12:00"
@@ -57,27 +58,58 @@ preferred_rows     = ["D", "H"]         # range baris disukai — tengah studio 
 
 [device]
 device_id = "019e4e4e-f638-7fca-b747-69e48a9eef32"
+latitude  = "-8.210285710686566"
+longitude = "112.76613449641758"
+
+[payment]
+payment_method = "NETWORK_PAY"
+payment_option = "NETWORK_PAY_PG_QRIS"
+
+[polling]
+enabled                  = true
+interval_secs            = 2
+refresh_token_before_secs = 1500
+start_at                 = ""           # format "YYYY-MM-DD HH:MM:SS" WIB
+
+[notification]
+desktop_enabled     = true              # notifikasi pop-up Windows Toast
+desktop_sound       = true              # bell/beep speaker PC
+discord_enabled     = false             # webhook ke Discord channel
+discord_webhook_url = ""
+discord_mention     = ""                # "@everyone", "<@USER_ID>", atau "<@&ROLE_ID>"
 ```
+
+### Fitur Konfigurasi & Portabilitas
+* **Portable Path Resolution**: File `config.toml` dicari secara dinamis di direktori yang sama dengan tempat file binary `.exe` berada, aman dibuka via double-click di File Explorer maupun shortcut Desktop.
+* **Interactive Setup Wizard**: Menu interaktif di terminal untuk mengatur konfigurasi dengan nilai default (cukup tekan `Enter` untuk mempertahankan nilai lama).
+* **Live Hot-Reload**: Saat bot dalam mode standby/polling, perubahan pada `config.toml` (di-edit & di-save via Notepad) otomatis dimuat ulang seketika tanpa perlu me-restart bot. Jika ada kesalahan sintaks, bot mempertahankan konfigurasi sebelumnya tanpa crash.
 
 ---
 
 ## 4. Alur Bot
 
 ```
-1. Load config.toml
-2. (Opsional) Standby sampai polling.start_at (war timer)
-3. POST /v1/auth → guest token (anonymous, client_id="tixid_guest")
-4. LOGIN (pakai guest token) → user JWT + refresh_token
-5. GET movie by movie_id → dapat schedule_id (data.id); poll jika UPCOMING
-6. GET schedule dates → pilih date (config / otomatis = tanggal pertama tersedia)
-7. GET theaters + showtimes (page=1) → ranking semua bioskop sesuai theater_priority
-8. Untuk setiap bioskop dalam ranking:
-   a. GET seat layout
-   b. Cari N kursi BERURUTAN (berdampingan) → jika ada, lanjut ke langkah 9
-   c. Jika tidak ada → coba bioskop berikutnya
-9. POST create order → tampilkan ringkasan + deadline bayar
-10. POST checkout (QRIS) → tampilkan QRIS code + render QR di terminal
-11. Token refresh via /v1/users/refresh saat standby lama (fallback: full re-login)
+1. Startup: Tampilkan menu interaktif ([1] Mulai Bot, [2] Setup Wizard, [3] Keluar).
+   (Jika config.toml belum ada, otomatis masuk ke Setup Wizard terlebih dahulu).
+2. Load config.toml (dengan fallback & portable path resolution).
+3. (Opsional) Standby sampai polling.start_at (war timer).
+4. POST /v1/auth → guest token (anonymous, client_id="tixid_guest").
+5. LOGIN (pakai guest token) → user JWT + refresh_token.
+6. GET movie by movie_id → dapat schedule_id (data.id); poll jika UPCOMING.
+   (Live Hot-Reload aktif selama loop polling jika config.toml diedit).
+7. GET schedule dates → pilih date (config / otomatis = tanggal pertama tersedia).
+8. GET theaters + showtimes (page=1) → ranking semua bioskop sesuai theater_priority.
+9. Parallel Seat Layout Race:
+   a. Kirim request seat layout ke semua bioskop secara paralel serentak.
+   b. Konfirmasi pemenang berdasarkan urutan prioritas yang memiliki N kursi berurutan.
+   c. Batalkan (abort) seluruh sisa request yang prioritasnya lebih rendah.
+10. POST create order → tampilkan ringkasan + deadline bayar.
+11. POST checkout (QRIS) → tampilkan QRIS code + render QR di terminal.
+12. Kirim Notifikasi:
+    - Pop-up Windows Toast Notification ke desktop.
+    - Suara audio alert / terminal bell ke speaker PC.
+    - Discord Webhook: Rich Embed lengkap (film, bioskop, kursi, nominal total, rincian biaya, batas bayar WIB, render gambar QRIS aktif, dan mention).
+13. Token refresh via /v1/users/refresh saat standby lama (fallback: full re-login).
 ```
 
 ---
@@ -737,14 +769,10 @@ tixid-bot/
 
 ## 10. Fase Pengembangan
 
-| Fase                        | Fitur                                                                              |
-| --------------------------- | ---------------------------------------------------------------------------------- |
-| ✅ **v1.0** — Core Bot      | Login, browse movie, pilih jadwal, auto-select kursi berurutan, create order       |
-| ✅ **v1.1** — Payment       | QRIS checkout, render QR di terminal, QR image URL                                 |
-| ✅ **v1.2** — Sniper Mode   | Loop polling + `start_at` war timer, auto token refresh via refresh_token endpoint |
-| ✅ **v1.3** — Logging       | Non-blocking async file logging, log semua request/response JSON                   |
-| ✅ **v1.4** — Smart Seating | Parallel race: semua seat layout fetch serentak, winner by rank, abort losers      |
-| 🔲 **v1.5** — Multi-account | Support beberapa akun sekaligus (concurrent)                                       |
+| Versi                                          | Fitur                                                                              |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------- |
+| ✅ **v1.0.0-beta**                             | Initial Feature Set: Core Bot, QRIS Checkout, Sniper Mode, Async Logging, Smart Seating (Parallel Race), Multi-format Layout (XXI/Cinepolis/CGV), Notifikasi (Windows Toast, Beep, Discord Webhook), Interactive Setup Wizard & Live Hot-Reload |
+| 🔲 **v1.1.0**                                  | Multi-account support (concurrent)                                                 |
 
 ---
 
