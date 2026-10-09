@@ -25,6 +25,32 @@ pub async fn run() -> Result<()> {
 
     // ── 1. Load config ───────────────────────────────────────────────────────
     let mut cfg = config::load()?;
+    if cfg.debug.verbose_timing {
+        api::set_verbose_timing(true);
+    }
+
+    if api::is_verbose_timing() {
+        print!("📡 Mengukur latensi koneksi (Ping TCP ke api-b2b.tix.id)...");
+        let _ = std::io::stdout().flush();
+        match api::probe_network_rtt().await {
+            Ok(rtt) => {
+                let rtt_ms = rtt.as_millis();
+                let quality = if rtt_ms < 35 {
+                    "Sangat Cepat 🚀"
+                } else if rtt_ms < 85 {
+                    "Bagus & Stabil 👍"
+                } else {
+                    "Tinggi / Berpotensi Lambat ⚠️"
+                };
+                println!("\r📡 Base Network Ping (TCP RTT): {}ms ({})          ", rtt_ms, quality);
+            }
+            Err(e) => {
+                println!("\r⚠️  Gagal mengukur TCP ping: {}          ", e);
+            }
+        }
+        let metrics = crate::metrics::sample_metrics();
+        println!("💻 Bot System Footprint        : RAM: {:.1} MB • CPU: {:.1}%", metrics.ram_mb, metrics.cpu_percent);
+    }
 
     // ── 2. Pre-Authentication (Strategi A) ──────────────────────────────────
     // Login SEBELUM standby agar token dan koneksi TCP/TLS sudah siap saat war!
@@ -490,7 +516,12 @@ async fn run_beacon_mode(
                         }
                     }
                 } else {
-                    println!("\r⏳ [BEACON] Belum terdaftar di katalog. Coba lagi dalam {} menit...", cfg.polling.beacon_interval_mins);
+                    if api::is_verbose_timing() {
+                        let chip = crate::metrics::format_metrics_chip();
+                        println!("\r⏳ [BEACON] Belum terdaftar di katalog. Coba lagi dalam {} menit... [{}]", cfg.polling.beacon_interval_mins, chip);
+                    } else {
+                        println!("\r⏳ [BEACON] Belum terdaftar di katalog. Coba lagi dalam {} menit...", cfg.polling.beacon_interval_mins);
+                    }
                 }
             }
             Err(e) => {
@@ -792,10 +823,18 @@ async fn wait_or_fail(cfg: &config::Config, reason: &str) -> Result<()> {
         return Err(anyhow::anyhow!(reason.to_string()));
     }
 
-    println!(
-        "⏱️  {} Retry in {}s...",
-        reason, cfg.polling.interval_secs
-    );
+    if api::is_verbose_timing() {
+        let chip = crate::metrics::format_metrics_chip();
+        println!(
+            "⏱️  {} Retry in {}s... [{}]",
+            reason, cfg.polling.interval_secs, chip
+        );
+    } else {
+        println!(
+            "⏱️  {} Retry in {}s...",
+            reason, cfg.polling.interval_secs
+        );
+    }
     tracing::warn!(reason = %reason, retry_in_secs = cfg.polling.interval_secs, "polling retry");
     sleep(Duration::from_secs(cfg.polling.interval_secs)).await;
     Ok(())
@@ -807,10 +846,18 @@ async fn wait_upcoming_or_fail(cfg: &config::Config, reason: &str) -> Result<()>
     }
 
     let interval_secs = (cfg.polling.beacon_interval_mins * 60).max(cfg.polling.interval_secs);
-    println!(
-        "⏱️  {} Cek jadwal ulang dalam {} menit...",
-        reason, cfg.polling.beacon_interval_mins
-    );
+    if api::is_verbose_timing() {
+        let chip = crate::metrics::format_metrics_chip();
+        println!(
+            "⏱️  {} Cek jadwal ulang dalam {} menit... [{}]",
+            reason, cfg.polling.beacon_interval_mins, chip
+        );
+    } else {
+        println!(
+            "⏱️  {} Cek jadwal ulang dalam {} menit...",
+            reason, cfg.polling.beacon_interval_mins
+        );
+    }
     tracing::warn!(reason = %reason, retry_in_secs = interval_secs, "upcoming polling retry");
 
     let steps = interval_secs / 5;
@@ -893,6 +940,7 @@ mod tests {
             payment: PaymentConfig { payment_method: "M".into(), payment_option: "O".into() },
             polling: PollingConfig { enabled: false, interval_secs: 5, refresh_token_before_secs: 300, start_at: "".into(), beacon_interval_mins: 15 },
             notification: Default::default(),
+            debug: Default::default(),
         }
     }
 

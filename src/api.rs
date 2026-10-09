@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Serialize, de::DeserializeOwned};
@@ -7,20 +10,168 @@ use crate::models::*;
 /// All API endpoints use the same gateway.
 const BASE: &str = "https://api-b2b.tix.id";
 
-// ── internal helpers ─────────────────────────────────────────────────────────
+static VERBOSE_TIMING: AtomicBool = AtomicBool::new(false);
 
-/// Reads response body, logs it, checks `success`, deserialises `data`.
-async fn parse_api<T: DeserializeOwned>(resp: reqwest::Response, ctx: &str) -> Result<T> {
-    let status = resp.status().as_u16();
-    let text = resp
-        .text()
+/// Enable or disable printing detailed HTTP request timing metrics to terminal.
+pub fn set_verbose_timing(enabled: bool) {
+    VERBOSE_TIMING.store(enabled, Ordering::Relaxed);
+}
+
+/// Check if verbose HTTP timing mode is currently enabled.
+pub fn is_verbose_timing() -> bool {
+    VERBOSE_TIMING.load(Ordering::Relaxed)
+}
+
+/// Detailed network & server timing metrics for an HTTP request.
+#[derive(Debug, Clone)]
+pub struct HttpTiming {
+    pub endpoint: String,
+    pub method: String,
+    pub status: u16,
+    pub total_ms: u128,
+    pub ttfb_ms: u128,
+    pub server_upstream_ms: Option<u64>,
+    pub server_proxy_ms: Option<u64>,
+    pub network_rtt_ms: u128,
+    pub download_ms: u128,
+    pub parse_ms: u128,
+    pub payload_bytes: usize,
+}
+
+/// Measures direct TCP handshake RTT to api-b2b.tix.id:443.
+pub async fn probe_network_rtt() -> Result<std::time::Duration> {
+    let t0 = Instant::now();
+    let stream = tokio::net::TcpStream::connect("api-b2b.tix.id:443")
         .await
-        .with_context(|| format!("{ctx}: failed to read body"))?;
+        .context("Gagal terhubung ke api-b2b.tix.id:443")?;
+    let rtt = t0.elapsed();
+    drop(stream);
+    Ok(rtt)
+}
 
-    tracing::debug!(endpoint = ctx, status, response = %text, "← response");
+/// Prints a formatted visual breakdown of where request latency was spent.
+pub fn print_timing_breakdown(t: &HttpTiming) {
+    let size_kb = t.payload_bytes as f64 / 1024.0;
+    let upstream = t.server_upstream_ms.unwrap_or(0);
+    let proxy = t.server_proxy_ms.unwrap_or(0);
+    let server_total = (upstream + proxy) as u128;
+    let total = t.total_ms.max(1);
 
-    let json: serde_json::Value =
-        serde_json::from_str(&text).with_context(|| format!("{ctx}: invalid JSON"))?;
+    let net_pct = (t.network_rtt_ms as f64 / total as f64 * 100.0).round() as u64;
+    let srv_pct = (server_total as f64 / total as f64 * 100.0).round() as u64;
+    let dl_pct = (t.download_ms as f64 / total as f64 * 100.0).round() as u64;
+
+    let sys = crate::metrics::sample_metrics();
+
+    println!("  ┌─ ⏱️  [{} {}] Total: {}ms (Payload: {:.1} KB, Status: {})", t.method, t.endpoint, t.total_ms, size_kb, t.status);
+    println!("  ├─ 🌐 Network RTT (Transit) : {:>3}ms ({:>2}%)", t.network_rtt_ms, net_pct);
+    println!("  ├─ ⚙️  Server Backend (TIX)  : {:>3}ms ({:>2}%) [Upstream: {}ms, Proxy: {}ms]", server_total, srv_pct, upstream, proxy);
+    println!("  ├─ 📥 Download Stream       : {:>3}ms ({:>2}%)", t.download_ms, dl_pct);
+    println!("  ├─ 🧩 JSON Parse (CPU)      : {:>3}ms", t.parse_ms);
+    println!("  ├─ 💻 Bot System Footprint  : RAM: {:.1} MB • CPU: {:.1}%", sys.ram_mb, sys.cpu_percent);
+
+    if srv_pct > 60 {
+        println!("  └─ 💡 Kesimpulan: {}% waktu dihabiskan oleh SERVER TIX ID (Koneksi internet Anda cepat).", srv_pct);
+    } else if net_pct > 60 {
+        println!("  └─ 💡 Kesimpulan: {}% waktu dihabiskan di JARINGAN INTERNET (Server TIX ID sebenarnya cepat, koneksi Anda lemot!).", net_pct);
+    } else {
+        println!("  └─ 💡 Kesimpulan: Waktu terbagi seimbang antara Jaringan ({}%) dan Server TIX ID ({}%).", net_pct, srv_pct);
+    }
+}
+
+struct RawApiResponse {
+    pub status: reqwest::StatusCode,
+    pub bytes: Vec<u8>,
+    pub timing: HttpTiming,
+}
+
+async fn execute_with_timing(
+    client: &Client,
+    req: reqwest::Request,
+    ctx: &str,
+) -> Result<RawApiResponse> {
+    let method = req.method().to_string();
+    let t0 = Instant::now();
+
+    let resp = client
+        .execute(req)
+        .await
+        .with_context(|| format!("{ctx} request failed"))?;
+
+    let ttfb = t0.elapsed();
+    let status = resp.status();
+
+    // Extract Kong latency headers from TIX ID server
+    let upstream_ms: Option<u64> = resp
+        .headers()
+        .get("x-kong-upstream-latency")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse().ok());
+
+    let proxy_ms: Option<u64> = resp
+        .headers()
+        .get("x-kong-proxy-latency")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse().ok());
+
+    let t_dl = Instant::now();
+    let body_bytes = resp
+        .bytes()
+        .await
+        .with_context(|| format!("{ctx}: failed to read response body"))?;
+    let download_time = t_dl.elapsed();
+    let payload_bytes = body_bytes.len();
+    let bytes = body_bytes.to_vec();
+    let total_time = t0.elapsed();
+
+    let server_processing_ms = (upstream_ms.unwrap_or(0) + proxy_ms.unwrap_or(0)) as u128;
+    let network_rtt_ms = ttfb.as_millis().saturating_sub(server_processing_ms);
+
+    let timing = HttpTiming {
+        endpoint: ctx.to_string(),
+        method,
+        status: status.as_u16(),
+        total_ms: total_time.as_millis(),
+        ttfb_ms: ttfb.as_millis(),
+        server_upstream_ms: upstream_ms,
+        server_proxy_ms: proxy_ms,
+        network_rtt_ms,
+        download_ms: download_time.as_millis(),
+        parse_ms: 0,
+        payload_bytes,
+    };
+
+    Ok(RawApiResponse {
+        status,
+        bytes,
+        timing,
+    })
+}
+
+async fn parse_raw<T: DeserializeOwned>(mut raw: RawApiResponse, ctx: &str) -> Result<T> {
+    let t_parse = Instant::now();
+    let json: serde_json::Value = serde_json::from_slice(&raw.bytes)
+        .with_context(|| format!("{ctx}: invalid JSON: {}", String::from_utf8_lossy(&raw.bytes)))?;
+    raw.timing.parse_ms = t_parse.elapsed().as_millis();
+    raw.timing.total_ms += raw.timing.parse_ms;
+
+    tracing::debug!(
+        endpoint = %raw.timing.endpoint,
+        status = raw.timing.status,
+        total_ms = raw.timing.total_ms,
+        ttfb_ms = raw.timing.ttfb_ms,
+        upstream_ms = ?raw.timing.server_upstream_ms,
+        proxy_ms = ?raw.timing.server_proxy_ms,
+        network_rtt_ms = raw.timing.network_rtt_ms,
+        download_ms = raw.timing.download_ms,
+        parse_ms = raw.timing.parse_ms,
+        bytes = raw.timing.payload_bytes,
+        "← HTTP Response Timing"
+    );
+
+    if is_verbose_timing() {
+        print_timing_breakdown(&raw.timing);
+    }
 
     let success = json
         .get("success")
@@ -38,7 +189,9 @@ async fn parse_api<T: DeserializeOwned>(resp: reqwest::Response, ctx: &str) -> R
         .with_context(|| format!("{ctx}: failed to parse `data` field"))
 }
 
-/// GET helper — logs URL then delegates to `parse_api`.
+// ── internal helpers ─────────────────────────────────────────────────────────
+
+/// GET helper — logs URL then delegates to `execute_with_timing` and `parse_raw`.
 async fn get_api<T: DeserializeOwned>(
     client: &Client,
     builder: reqwest::RequestBuilder,
@@ -49,14 +202,11 @@ async fn get_api<T: DeserializeOwned>(
         .with_context(|| format!("{ctx}: failed to build request"))?;
     tracing::debug!(endpoint = ctx, method = "GET", url = %req.url(), "→ request");
 
-    let resp = client
-        .execute(req)
-        .await
-        .with_context(|| format!("{ctx} request failed"))?;
-    parse_api(resp, ctx).await
+    let raw = execute_with_timing(client, req, ctx).await?;
+    parse_raw(raw, ctx).await
 }
 
-/// POST helper — serialises body for logging, then sends.
+/// POST helper — serialises body for logging, then sends with timing.
 async fn post_api<B, T>(client: &Client, url: &str, body: &B, ctx: &str) -> Result<T>
 where
     B: Serialize,
@@ -65,13 +215,14 @@ where
     let body_json = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_owned());
     tracing::debug!(endpoint = ctx, method = "POST", url, request = %body_json, "→ request");
 
-    let resp = client
+    let req = client
         .post(url)
         .json(body)
-        .send()
-        .await
-        .with_context(|| format!("{ctx} request failed"))?;
-    parse_api(resp, ctx).await
+        .build()
+        .with_context(|| format!("{ctx}: failed to build request"))?;
+
+    let raw = execute_with_timing(client, req, ctx).await?;
+    parse_raw(raw, ctx).await
 }
 
 // ── public API functions ─────────────────────────────────────────────────────
@@ -90,12 +241,12 @@ pub async fn get_guest_token(client: &Client) -> Result<GuestAuthData> {
 pub async fn refresh_user_token(client: &Client) -> Result<RefreshData> {
     let url = format!("{BASE}/v1/users/refresh");
     tracing::debug!(endpoint = "refresh_token", method = "POST", url = %url, "→ request");
-    let resp = client
+    let req = client
         .post(&url)
-        .send()
-        .await
-        .context("refresh_token request failed")?;
-    parse_api(resp, "refresh_token").await
+        .build()
+        .context("refresh_token: failed to build request")?;
+    let raw = execute_with_timing(client, req, "refresh_token").await?;
+    parse_raw(raw, "refresh_token").await
 }
 
 /// POST /v1/users/login → JWT token + user info
@@ -134,24 +285,23 @@ pub async fn get_schedule_dates(
         "→ request"
     );
 
-    let response = client
-        .execute(req)
-        .await
-        .context("get_schedule_dates request failed")?;
-
-    let status = response.status();
+    let raw = execute_with_timing(client, req, "get_schedule_dates").await?;
+    let status = raw.status;
     if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::NOT_FOUND {
-        let text = response.text().await.unwrap_or_default();
+        let text = String::from_utf8_lossy(&raw.bytes);
         tracing::debug!(
             endpoint = "get_schedule_dates",
             status = status.as_u16(),
             response = %text,
             "← schedule not found"
         );
+        if is_verbose_timing() {
+            print_timing_breakdown(&raw.timing);
+        }
         return Ok(None);
     }
 
-    let data: Vec<ScheduleDate> = parse_api(response, "get_schedule_dates").await?;
+    let data: Vec<ScheduleDate> = parse_raw(raw, "get_schedule_dates").await?;
     Ok(Some(data))
 }
 

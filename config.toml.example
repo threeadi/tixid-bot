@@ -88,3 +88,8 @@ discord_webhook_url = ""
 # Opsional mention di Discord (contoh: "@everyone", "<@USER_ID>", atau "<@&ROLE_ID>"). Kosongkan jika tanpa mention.
 discord_mention = ""
 
+[debug]
+# Tampilkan breakdown rincian waktu request HTTP di terminal (Network RTT, Server Processing, Download, Parse).
+# Membantu mengetahui apakah latensi 150ms terjadi karena server TIX ID atau karena jaringan internet Anda.
+# Bisa juga diaktifkan sementara lewat flag CLI: cargo run -- --verbose (atau -v).
+verbose_timing = false

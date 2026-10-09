@@ -10,6 +10,7 @@ mod notifier;
 mod seat_selector;
 mod theater_selector;
 mod wizard;
+pub mod metrics;
 
 use std::io::{self, Write};
 
@@ -35,6 +36,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Check CLI flags
     let args: Vec<String> = std::env::args().collect();
+    let verbose_cli = args.iter().any(|a| a == "--verbose" || a == "-v");
+    let cfg_initial = config::load().unwrap_or_default();
+    api::set_verbose_timing(verbose_cli || cfg_initial.debug.verbose_timing);
+
     if args.iter().any(|a| a == "--setup" || a == "-s") {
         if wizard::run_setup()? {
             run_bot_safe().await?;
@@ -60,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
     // Interactive Menu Loop
     loop {
         let cfg = config::load().unwrap_or_default();
+        api::set_verbose_timing(verbose_cli || cfg.debug.verbose_timing);
 
         println!();
         println!("🎬 TIX.ID Bot [v1.0.0-beta]");

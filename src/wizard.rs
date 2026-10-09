@@ -80,6 +80,9 @@ pub fn print_config_status(cfg: &Config) {
     println!("   Status Target : {}", mode_str);
     println!("   Kota & Tanggal: ID {} • {}", cfg.target.city_id, date_str);
     println!("   Preferensi    : {} Tiket • Jam {}", cfg.seat.quantity, time_str);
+    if cfg.debug.verbose_timing || crate::api::is_verbose_timing() {
+        println!("   Mode Debug    : Verbose HTTP Timing Aktif (RTT & Latensi)");
+    }
 }
 
 /// Prompt terpadu untuk memilih Mode War Langsung vs Mode Beaconing serta detail target film.

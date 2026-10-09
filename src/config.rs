@@ -16,6 +16,15 @@ pub struct Config {
     pub polling: PollingConfig,
     #[serde(default)]
     pub notification: NotificationConfig,
+    #[serde(default)]
+    pub debug: DebugConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DebugConfig {
+    /// Tampilkan rincian metrik timing HTTP per request di terminal (RTT, Server Upstream, Download, Parse)
+    #[serde(default)]
+    pub verbose_timing: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -177,6 +186,7 @@ impl Default for Config {
                 beacon_interval_mins: 15,
             },
             notification: NotificationConfig::default(),
+            debug: DebugConfig::default(),
         }
     }
 }
@@ -510,6 +520,53 @@ discord_mention = "<@123456789>"
         assert_eq!(c.polling.interval_secs, 30);
         assert_eq!(c.polling.refresh_token_before_secs, 300);
         assert_eq!(c.polling.start_at, "");
+        assert!(!c.debug.verbose_timing);
+    }
+
+    #[test]
+    fn deserialize_debug_fields() {
+        let toml_str = r#"
+[auth]
+msisdn = "08123"
+password = "pw"
+
+[target]
+city_id = "c1"
+date = ""
+
+[theater]
+theater_priority = []
+
+[showtime]
+preferred_time_start = ""
+preferred_time_end = ""
+
+[seat]
+quantity = 1
+manual_seats = []
+avoid_first_rows = 0
+preferred_rows = []
+
+[device]
+device_id = "d"
+longitude = "0"
+latitude = "0"
+
+[payment]
+payment_method = "M"
+payment_option = "O"
+
+[polling]
+enabled = false
+interval_secs = 5
+refresh_token_before_secs = 60
+start_at = ""
+
+[debug]
+verbose_timing = true
+"#;
+        let c: Config = toml::from_str(toml_str).unwrap();
+        assert!(c.debug.verbose_timing);
     }
 
     #[test]
